@@ -1,5 +1,9 @@
 import { Card, Tooltip } from "@agentscope-ai/design";
 import { useTranslation } from "react-i18next";
+import type {
+  SingleChannelConfig,
+  VoiceChannelConfig,
+} from "../../../../api/types";
 import { getChannelLabel, type ChannelKey } from "./constants";
 import styles from "../index.module.less";
 
@@ -63,8 +67,18 @@ export function ChannelCard({
       </div>
 
       <div className={styles.cardDescription}>
-        {t("channels.botPrefix")}:{" "}
-        {(config.bot_prefix as string) || t("channels.notSet")}
+        {channelKey === "voice" ? (
+          <>
+            {t("channels.phoneNumber")}:{" "}
+            {(config as VoiceChannelConfig).phone_number ||
+              t("channels.notSet")}
+          </>
+        ) : (
+          <>
+            {t("channels.botPrefix")}:{" "}
+            {(config as SingleChannelConfig).bot_prefix || t("channels.notSet")}
+          </>
+        )}
       </div>
 
       <div className={styles.cardHint}>{t("channels.clickCardToEdit")}</div>
