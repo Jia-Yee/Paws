@@ -19,7 +19,7 @@ class VoiceProcessorConfig:
     vad_type: str = "silero"
     vad_threshold: float = 0.5
     asr_type: str = "funasr"
-    asr_model: str = "paraformer-zh"
+    asr_model: str = "iic/speech_paraformer_zh-cn_16k_common-vocab8404_pytorch"
     tts_type: str = "edge"
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
     sample_rate: int = 16000
@@ -104,41 +104,22 @@ class VoiceProcessor:
         audio_data: bytes,
         sample_rate: Optional[int] = None,
     ) -> Optional[str]:
-        if self._vad is None:
+        if self._asr is None:
             await self.initialize()
 
         sample_rate = sample_rate or self._config.sample_rate
-        vad_result = self._vad.is_speech(audio_data, sample_rate)
-        current_time = asyncio.get_event_loop().time()
-
-        async with self._lock:
-            if vad_result.is_speech:
-                if not self._is_speaking:
-                    self._is_speaking = True
-                    self._speech_start_time = current_time
-                    logger.debug(f"Speech started at {current_time}")
-                self._speech_buffer.append(audio_data)
-                self._silence_start_time = 0.0
-            else:
-                if self._is_speaking:
-                    if self._silence_start_time == 0.0:
-                        self._silence_start_time = current_time
-                    silence_duration = (current_time - self._silence_start_time) * 1000
-                    if silence_duration >= self._config.min_silence_duration_ms:
-                        logger.debug(f"Speech ended after {silence_duration:.0f}ms silence")
-                        text = await self._process_speech_segment()
-                        self._is_speaking = False
-                        self._speech_buffer.clear()
-                        self._silence_start_time = 0.0
-                        return text
-
-        return None
-
-    async def _process_speech_segment(self) -> Optional[str]:
-        if not self._speech_buffer:
-            return None
-
-        audio_data = b"".join(self._speech_buffer)
+        
+        # 直接处理整个音频数据，不使用 VAD
+        # 因为我们已经在 ESP32 端处理了 VAD
+        text = await self._process_speech_segment(audio_data)
+        return text
+    
+    async def _process_speech_segment(self, audio_data: Optional[bytes] = None) -> Optional[str]:
+        if audio_data is None:
+            if not self._speech_buffer:
+                return None
+            audio_data = b"" .join(self._speech_buffer)
+        
         if self._on_speech_detected:
             self._on_speech_detected(audio_data)
 

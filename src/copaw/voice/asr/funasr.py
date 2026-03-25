@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class FunASR(ASRBase):
     def __init__(
         self,
-        model: str = "paraformer-zh",
+        model: str = "iic/speech_paraformer_zh-cn_16k_common-vocab8404_pytorch",
         sample_rate: int = 16000,
         device: str = "cpu",
         offline: bool = True,
@@ -41,6 +41,7 @@ class FunASR(ASRBase):
             self._model = AutoModel(
                 model=self._model_name,
                 device=self._device,
+                disable_update=True  # 禁用更新检查，加快加载速度
             )
             logger.info(f"FunASR model '{self._model_name}' loaded successfully")
         except ImportError:

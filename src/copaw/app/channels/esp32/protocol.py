@@ -123,14 +123,16 @@ class XiaozhiProtocol:
     def parse(self, data: Union[str, bytes]) -> Optional[XiaozhiMessage]:
         if isinstance(data, bytes):
             if len(data) < 4:
-                return AudioMessage(data=data)
+                # 短数据默认为Opus格式
+                return AudioMessage(data=data, format=AudioFormat.OPUS)
             try:
                 text = data.decode("utf-8")
                 if text.startswith("{"):
                     return self._parse_json(text)
             except UnicodeDecodeError:
                 pass
-            return AudioMessage(data=data)
+            # 二进制音频数据默认为Opus格式
+            return AudioMessage(data=data, format=AudioFormat.OPUS)
 
         if isinstance(data, str):
             if data.startswith("{"):

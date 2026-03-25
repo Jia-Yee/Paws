@@ -176,7 +176,7 @@ class ESP32VoiceConfig(BaseModel):
     vad_type: str = "silero"
     vad_threshold: float = 0.5
     asr_type: str = "funasr"
-    asr_model: str = "paraformer-zh"
+    asr_model: str = "models/SenseVoiceSmall"
     tts_type: str = "edge"
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
     sample_rate: int = 16000

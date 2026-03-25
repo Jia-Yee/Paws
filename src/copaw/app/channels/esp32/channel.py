@@ -151,8 +151,8 @@ class ESP32Channel(BaseChannel):
         return VoiceProcessorConfig(
             vad_type=self.voice_config.get("vad_type", "silero"),
             vad_threshold=self.voice_config.get("vad_threshold", 0.5),
-            asr_type=self.voice_config.get("asr_type", "funasr"),
-            asr_model=self.voice_config.get("asr_model", "paraformer-zh"),
+            asr_type="funasr",
+            asr_model="models/SenseVoiceSmall",
             tts_type=self.voice_config.get("tts_type", "edge"),
             tts_voice=self.voice_config.get("tts_voice", "zh-CN-XiaoxiaoNeural"),
             sample_rate=self.voice_config.get("sample_rate", 16000),
@@ -177,7 +177,7 @@ class ESP32Channel(BaseChannel):
             "vad_type": os.getenv("ESP32_VAD_TYPE", "silero"),
             "vad_threshold": float(os.getenv("ESP32_VAD_THRESHOLD", "0.5")),
             "asr_type": os.getenv("ESP32_ASR_TYPE", "funasr"),
-            "asr_model": os.getenv("ESP32_ASR_MODEL", "paraformer-zh"),
+            "asr_model": os.getenv("ESP32_ASR_MODEL", "models/SenseVoiceSmall"),
             "tts_type": os.getenv("ESP32_TTS_TYPE", "edge"),
             "tts_voice": os.getenv("ESP32_TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
             "sample_rate": int(os.getenv("ESP32_SAMPLE_RATE", "16000")),
@@ -392,16 +392,22 @@ class ESP32Channel(BaseChannel):
         conn: ESP32DeviceConnection,
         message: Any,
     ) -> None:
-        logger.debug(f"Received message from {conn.device_id}: {message[:200]}{'...' if len(str(message)) > 200 else ''}")
+        # 记录接收到的消息类型和大小
+        if isinstance(message, bytes):
+            logger.info(f"Received binary data from {conn.device_id}: {len(message)} bytes")
+        else:
+            logger.debug(f"Received text message from {conn.device_id}: {message[:200]}{'...' if len(str(message)) > 200 else ''}")
+        
         parsed = self._protocol.parse(message)
         if parsed is None:
             logger.warning(f"Failed to parse message from {conn.device_id}")
             return
 
-        logger.debug(f"Parsed message type: {type(parsed).__name__}")
+        logger.info(f"Parsed message type: {type(parsed).__name__}")
         if isinstance(parsed, HelloMessage):
             await self._handle_hello_obj(conn, parsed)
         elif isinstance(parsed, AudioMessage):
+            logger.info(f"Processing audio message: {len(parsed.data)} bytes")
             await self._handle_audio_obj(conn, parsed)
         elif isinstance(parsed, TextMessage):
             await self._handle_text_obj(conn, parsed)
@@ -468,11 +474,15 @@ class ESP32Channel(BaseChannel):
         conn: ESP32DeviceConnection,
         msg: AudioMessage,
     ) -> None:
+        logger.info(f"Handling audio from {conn.device_id}: format={msg.format}, sample_rate={msg.sample_rate}, channels={msg.channels}, data_len={len(msg.data)}")
+        
         if conn.voice_processor is None:
+            logger.info(f"Initializing voice processor for {conn.device_id}")
             conn.voice_processor = VoiceProcessor(config=self._voice_processor_config)
             await conn.voice_processor.initialize()
 
         if conn.state == DeviceState.SPEAKING:
+            logger.info(f"Device is speaking, aborting for {conn.device_id}")
             await self._handle_abort(conn)
 
         conn.state = DeviceState.LISTENING
@@ -483,31 +493,56 @@ class ESP32Channel(BaseChannel):
             try:
                 # 初始化 Opus 解码器（如果需要）
                 if conn._opus_decoder is None:
+                    logger.info(f"Initializing Opus decoder for {conn.device_id}: sample_rate={msg.sample_rate}, channels={msg.channels}")
                     conn._opus_decoder = OpusDecoder(
                         sample_rate=msg.sample_rate,
                         channels=msg.channels,
                     )
                 # 解码 Opus 到 PCM
+                logger.debug(f"Decoding Opus audio: {len(audio_data)} bytes")
                 audio_data = conn._opus_decoder.decode(audio_data)
+                logger.debug(f"Decoded to PCM: {len(audio_data)} bytes")
             except OpusCodecError as e:
                 logger.error(f"Opus decode error: {e}")
                 return
         
-        conn._audio_buffer.append(audio_data)
-
-        text = await conn.voice_processor.process_audio(audio_data, msg.sample_rate)
-        if text:
-            # 发送 STT 消息给设备
-            stt_msg = self._protocol.encode_stt(
-                text=text,
-                session_id=conn.session_id,
-                is_final=True
-            )
-            await conn.websocket.send(stt_msg)
-            logger.info(f"STT sent to {conn.device_id}: {text}")
+        # 重采样音频到 16000Hz，因为 ASR 模型期望 16kHz 音频
+        resampled_audio = resample_audio(audio_data, msg.sample_rate, 16000)
+        logger.debug(f"Resampled audio from {msg.sample_rate}Hz to 16000Hz: {len(audio_data)} bytes -> {len(resampled_audio)} bytes")
+        
+        # 累积音频数据
+        conn._audio_buffer.append(resampled_audio)
+        logger.debug(f"Audio buffer size: {len(conn._audio_buffer)} chunks, total bytes: {sum(len(chunk) for chunk in conn._audio_buffer)}")
+        
+        # 当音频缓冲区达到一定大小或者接收到足够的音频数据时，处理整个语音段
+        # 这里我们设置一个阈值，当缓冲区大小超过 1MB 时处理，或者当接收到 10 个音频块时处理
+        if len(conn._audio_buffer) >= 10 or sum(len(chunk) for chunk in conn._audio_buffer) >= 1024 * 1024:
+            logger.info(f"Processing accumulated audio data for {conn.device_id}")
+            # 合并所有音频数据
+            combined_audio = b"".join(conn._audio_buffer)
+            logger.info(f"Combined audio size: {len(combined_audio)} bytes")
             
-            # 处理用户文本
-            await self._process_user_text(conn, text)
+            # 处理合并后的音频数据
+            text = await conn.voice_processor.process_audio(combined_audio, 16000)
+            if text:
+                logger.info(f"Voice processor returned text: {text}")
+                # 发送 STT 消息给设备
+                stt_msg = self._protocol.encode_stt(
+                    text=text,
+                    session_id=conn.session_id,
+                    is_final=True
+                )
+                await conn.websocket.send(stt_msg)
+                logger.info(f"STT sent to {conn.device_id}: {text}")
+                
+                # 处理用户文本
+                await self._process_user_text(conn, text)
+                # 清空音频缓冲区，准备下一段语音
+                conn._audio_buffer.clear()
+            else:
+                logger.debug(f"No text returned from voice processor for {conn.device_id}")
+                # 清空音频缓冲区，准备下一段语音
+                conn._audio_buffer.clear()
 
     async def _handle_text_obj(
         self,
