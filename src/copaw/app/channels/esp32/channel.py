@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import websockets
-from websockets.asyncio.server import serve
+from websockets.server import serve
 
 from ..base import (
     BaseChannel,
@@ -305,7 +305,7 @@ class ESP32Channel(BaseChannel):
 
     async def _handle_connection(
         self,
-        websocket: websockets.ServerConnection,
+        websocket,
     ) -> None:
         device_id = await self._authenticate(websocket)
         if not device_id:
@@ -337,7 +337,7 @@ class ESP32Channel(BaseChannel):
 
     async def _authenticate(
         self,
-        websocket: websockets.ServerConnection,
+        websocket,
     ) -> Optional[str]:
         device_id = None
         
@@ -345,21 +345,26 @@ class ESP32Channel(BaseChannel):
             # 尝试从 headers 中获取 device-id
             headers = dict(websocket.request.headers)
             device_id = headers.get("device-id") or headers.get("device_id")
+            logger.info(f"Headers: {headers}")
 
             # 如果 headers 中没有，尝试从 URL 查询参数中获取
             if not device_id:
                 from urllib.parse import parse_qs, urlparse
                 request_path = websocket.request.path or ""
+                logger.info(f"Request path: {request_path}")
                 parsed_url = urlparse(request_path)
                 query_params = parse_qs(parsed_url.query)
+                logger.info(f"Query params: {query_params}")
                 device_id = query_params.get("device-id", [None])[0]
 
             # 测试用：如果没有 device-id，使用默认值
             if not device_id:
                 device_id = "test-device-default"
+            logger.info(f"Device ID: {device_id}")
 
             # 检查设备是否在允许列表中
             if self.allowed_devices and device_id not in self.allowed_devices:
+                logger.warning(f"Device {device_id} not in allowed list")
                 return None
 
             # 检查认证 token
@@ -368,12 +373,14 @@ class ESP32Channel(BaseChannel):
                 if token.startswith("Bearer "):
                     token = token[7:]
                 if not self._verify_token(token, device_id):
+                    logger.warning(f"Invalid token for device {device_id}")
                     return None
 
         except Exception as e:
             logger.error(f"Error in authentication: {e}")
             # 即使出错，也返回默认 device-id 以允许连接
             device_id = "test-device-default"
+            logger.info(f"Using default device ID: {device_id}")
 
         return device_id
 
@@ -437,11 +444,19 @@ class ESP32Channel(BaseChannel):
 
         conn.voice_processor = None
 
+        # 根据文档规范，返回符合格式的 hello 响应
         response = self._protocol.encode_hello(
             device_id="copaw-server",
             client_id="copaw",
-            version="1.0",
-            capabilities=["audio", "text", "streaming"],
+            version="1",
+            features={"mcp": True},
+            transport="websocket",
+            audio_params={
+                "format": "opus",
+                "sample_rate": 16000,
+                "channels": 1,
+                "frame_duration": 60,
+            },
         )
         await conn.websocket.send(response)
         logger.info(f"HELLO processed for {conn.device_id}")
@@ -551,16 +566,24 @@ class ESP32Channel(BaseChannel):
     ) -> None:
         conn.client_id = msg.get("client_id", msg.get("client-id", ""))
         conn.version = msg.get("version", "")
-        conn.audio_config = msg.get("audio_config", {})
+        conn.audio_config = msg.get("audio_params", msg.get("audio_config", {}))
 
         # Don't initialize voice processor here, do it lazily when needed
         conn.voice_processor = None
 
+        # 根据文档规范，返回符合格式的 hello 响应
         response = self._protocol.encode_hello(
             device_id="copaw-server",
             client_id="copaw",
-            version="1.0",
-            capabilities=["audio", "text", "streaming"],
+            version="1",
+            features={"mcp": True},
+            transport="websocket",
+            audio_params={
+                "format": "opus",
+                "sample_rate": 16000,
+                "channels": 1,
+                "frame_duration": 60,
+            },
         )
         await conn.websocket.send(response)
         logger.info(f"HELLO processed for {conn.device_id}")
@@ -629,6 +652,40 @@ class ESP32Channel(BaseChannel):
                 pass
         conn.state = DeviceState.IDLE
         conn._is_aborted = False
+
+    async def close_audio_channel(
+        self,
+        device_id: str,
+        send_goodbye: bool = False,
+    ) -> None:
+        """关闭音频通道，符合文档规范"""
+        async with self._connections_lock:
+            conn = self._connections.get(device_id)
+        
+        if conn:
+            try:
+                # 取消正在进行的任务
+                if conn._speaking_task and not conn._speaking_task.done():
+                    conn._speaking_task.cancel()
+                    try:
+                        await conn._speaking_task
+                    except asyncio.CancelledError:
+                        pass
+                
+                # 关闭 WebSocket 连接
+                if conn.websocket:
+                    try:
+                        await conn.websocket.close()
+                    except Exception:
+                        pass
+                
+                # 清理连接
+                async with self._connections_lock:
+                    self._connections.pop(device_id, None)
+                
+                logger.info(f"Audio channel closed for {device_id}")
+            except Exception:
+                logger.exception(f"Error closing audio channel for {device_id}")
 
     async def _handle_ping(
         self,

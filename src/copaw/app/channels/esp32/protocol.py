@@ -252,7 +252,7 @@ class XiaozhiProtocol:
             client_id=obj.get("client_id", obj.get("client-id", "")),
             version=str(obj.get("version", "")),
             capabilities=capabilities,
-            audio_config=obj.get("audio_config", obj.get("audio_params", {})),
+            audio_config=obj.get("audio_params", obj.get("audio_config", {})),
             features=features,
             transport=obj.get("transport", "websocket"),
         )
@@ -341,27 +341,26 @@ class XiaozhiProtocol:
         device_id: str,
         client_id: str = "",
         version: str = "1",
-        capabilities: Optional[List[str]] = None,
-        audio_config: Optional[Dict[str, Any]] = None,
         features: Optional[Dict[str, Any]] = None,
         transport: str = "websocket",
+        audio_params: Optional[Dict[str, Any]] = None,
     ) -> str:
         msg = {
             "type": MessageType.HELLO.value,
-            "device_id": device_id,
-            "client_id": client_id,
-            "version": version,
-            "capabilities": capabilities or ["audio", "text", "streaming"],
-            "audio_params": audio_config or {
+            "version": int(version),
+            "features": features or {"mcp": True},
+            "transport": transport,
+            "audio_params": audio_params or {
                 "format": "opus",
                 "sample_rate": 16000,
                 "channels": 1,
                 "frame_duration": 60,
             },
-            "transport": transport,
         }
-        if features:
-            msg["features"] = features
+        if device_id:
+            msg["device_id"] = device_id
+        if client_id:
+            msg["client_id"] = client_id
         return json.dumps(msg)
 
     def encode_pong(self, timestamp: int = 0) -> str:

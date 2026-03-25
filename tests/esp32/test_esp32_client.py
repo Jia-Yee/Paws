@@ -27,55 +27,65 @@ logger = logging.getLogger(__name__)
 
 async def test_text_mode(uri: str, device_id: str):
     """Test text-based communication."""
-    headers = {"device-id": device_id}
+    # 模拟 ESP32 设备的连接方式，设置正确的头部信息
+    headers = {
+        "Device-Id": device_id,
+        "Protocol-Version": "1",
+        "Client-Id": "test-client-001",
+    }
     
     logger.info(f"Connecting to {uri} with device-id={device_id}")
     
-    async with websockets.connect(uri, additional_headers=headers) as ws:
-        logger.info("Connected! Sending HELLO message...")
-        
-        # Send HELLO
-        hello_msg = json.dumps({
-            "type": "hello",
-            "device_id": device_id,
-            "version": "1.0.0",
-            "capabilities": ["text", "audio"],
-            "audio_config": {
-                "format": "pcm",
-                "sample_rate": 16000,
-                "channels": 1,
-            },
-        })
-        await ws.send(hello_msg)
-        
-        # Wait for server response
-        response = await ws.recv()
-        logger.info(f"Server response: {response}")
-        
-        # Send text message
-        while True:
-            text = input("\nEnter message (or 'quit' to exit): ")
-            if text.lower() == "quit":
-                break
+    try:
+        async with websockets.connect(uri, additional_headers=headers) as ws:
+            logger.info("Connected! Sending HELLO message...")
             
-            text_msg = json.dumps({
-                "type": "text",
-                "text": text,
+            # Send HELLO
+            hello_msg = json.dumps({
+                "type": "hello",
+                "device_id": device_id,
+                "version": "1.0.0",
+                "capabilities": ["text", "audio"],
+                "audio_config": {
+                    "format": "pcm",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                },
             })
-            logger.info(f"Sending: {text_msg}")
-            await ws.send(text_msg)
+            await ws.send(hello_msg)
             
-            # Wait for response (may be audio or text)
-            try:
-                response = await asyncio.wait_for(ws.recv(), timeout=60.0)
-                if isinstance(response, bytes):
-                    logger.info(f"Received audio: {len(response)} bytes")
-                else:
-                    logger.info(f"Received: {response}")
-            except asyncio.TimeoutError:
-                logger.warning("No response within 60 seconds")
-        
-        logger.info("Closing connection...")
+            # Wait for server response
+            response = await ws.recv()
+            logger.info(f"Server response: {response}")
+            
+            # Send text message
+            while True:
+                text = input("\nEnter message (or 'quit' to exit): ")
+                if text.lower() == "quit":
+                    break
+                
+                text_msg = json.dumps({
+                    "type": "text",
+                    "text": text,
+                })
+                logger.info(f"Sending: {text_msg}")
+                await ws.send(text_msg)
+                
+                # Wait for response (may be audio or text)
+                try:
+                    response = await asyncio.wait_for(ws.recv(), timeout=60.0)
+                    if isinstance(response, bytes):
+                        logger.info(f"Received audio: {len(response)} bytes")
+                    else:
+                        logger.info(f"Received: {response}")
+                except asyncio.TimeoutError:
+                    logger.warning("No response within 60 seconds")
+            
+            logger.info("Closing connection...")
+    except Exception as e:
+        logger.error(f"Connection error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def test_ping(uri: str, device_id: str):
@@ -98,8 +108,8 @@ async def main():
     parser = argparse.ArgumentParser(description="ESP32 Channel Test Client")
     parser.add_argument(
         "--host",
-        default="localhost",
-        help="ESP32 Channel host (default: localhost)",
+        default="127.0.0.1",
+        help="ESP32 Channel host (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
