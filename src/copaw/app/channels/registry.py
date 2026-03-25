@@ -30,6 +30,8 @@ _BUILTIN_SPECS: dict[str, tuple[str, str]] = {
     "voice": (".voice", "VoiceChannel"),
     "wecom": (".wecom", "WecomChannel"),
     "xiaoyi": (".xiaoyi", "XiaoYiChannel"),
+    "esp32": (".esp32", "ESP32Channel"),
+    "esp32-mqtt": (".esp32", "ESP32MQTTChannel"),
 }
 
 # Required channels must load; failures are raised, not skipped.

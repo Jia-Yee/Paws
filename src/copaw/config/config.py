@@ -170,6 +170,31 @@ class XiaoYiConfig(BaseChannelConfig):
     task_timeout_ms: int = 3600000  # 1 hour task timeout
 
 
+class ESP32VoiceConfig(BaseModel):
+    """Voice processing configuration for ESP32 channel."""
+
+    vad_type: str = "silero"
+    vad_threshold: float = 0.5
+    asr_type: str = "funasr"
+    asr_model: str = "paraformer-zh"
+    tts_type: str = "edge"
+    tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    sample_rate: int = 16000
+    min_speech_duration_ms: int = 500
+    min_silence_duration_ms: int = 300
+
+
+class ESP32Config(BaseChannelConfig):
+    """ESP32 channel: WebSocket server for ESP32 devices."""
+
+    host: str = "0.0.0.0"
+    port: int = 8080
+    auth_enabled: bool = False
+    auth_key: str = ""
+    allowed_devices: List[str] = Field(default_factory=list)
+    voice: ESP32VoiceConfig = Field(default_factory=ESP32VoiceConfig)
+
+
 class ChannelConfig(BaseModel):
     """Built-in channel configs; extra keys allowed for plugin channels."""
 
@@ -188,6 +213,7 @@ class ChannelConfig(BaseModel):
     voice: VoiceChannelConfig = VoiceChannelConfig()
     wecom: WecomConfig = WecomConfig()
     xiaoyi: XiaoYiConfig = XiaoYiConfig()
+    esp32: ESP32Config = ESP32Config()
 
 
 class LastApiConfig(BaseModel):
@@ -912,6 +938,7 @@ ChannelConfigUnion = Union[
     VoiceChannelConfig,
     WecomConfig,
     XiaoYiConfig,
+    ESP32Config,
 ]
 
 
