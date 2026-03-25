@@ -63,6 +63,7 @@ class ESP32DeviceConnection:
         self.state: DeviceState = DeviceState.IDLE
         self.client_id: str = ""
         self.version: str = ""
+        self.session_id: str = ""
         self.audio_config: Dict[str, Any] = {}
         self.last_activity: float = time.time()
         self.voice_processor: Optional[VoiceProcessor] = None
@@ -342,20 +343,21 @@ class ESP32Channel(BaseChannel):
         device_id = None
         
         try:
-            # 尝试从 headers 中获取 device-id
-            headers = dict(websocket.request.headers)
-            device_id = headers.get("device-id") or headers.get("device_id")
-            logger.info(f"Headers: {headers}")
-
-            # 如果 headers 中没有，尝试从 URL 查询参数中获取
-            if not device_id:
-                from urllib.parse import parse_qs, urlparse
-                request_path = websocket.request.path or ""
-                logger.info(f"Request path: {request_path}")
-                parsed_url = urlparse(request_path)
-                query_params = parse_qs(parsed_url.query)
-                logger.info(f"Query params: {query_params}")
-                device_id = query_params.get("device-id", [None])[0]
+            # 尝试从 URL 查询参数中获取 device-id
+            # 注意：websockets 库的不同版本可能有不同的属性名
+            request_path = ""
+            if hasattr(websocket, 'path'):
+                request_path = websocket.path
+            elif hasattr(websocket, 'request') and hasattr(websocket.request, 'path'):
+                request_path = websocket.request.path
+            
+            logger.info(f"Request path: {request_path}")
+            
+            from urllib.parse import parse_qs, urlparse
+            parsed_url = urlparse(request_path)
+            query_params = parse_qs(parsed_url.query)
+            logger.info(f"Query params: {query_params}")
+            device_id = query_params.get("device-id", [None])[0]
 
             # 测试用：如果没有 device-id，使用默认值
             if not device_id:
@@ -366,15 +368,6 @@ class ESP32Channel(BaseChannel):
             if self.allowed_devices and device_id not in self.allowed_devices:
                 logger.warning(f"Device {device_id} not in allowed list")
                 return None
-
-            # 检查认证 token
-            if self.auth_enabled:
-                token = headers.get("authorization", "")
-                if token.startswith("Bearer "):
-                    token = token[7:]
-                if not self._verify_token(token, device_id):
-                    logger.warning(f"Invalid token for device {device_id}")
-                    return None
 
         except Exception as e:
             logger.error(f"Error in authentication: {e}")
@@ -399,11 +392,13 @@ class ESP32Channel(BaseChannel):
         conn: ESP32DeviceConnection,
         message: Any,
     ) -> None:
+        logger.debug(f"Received message from {conn.device_id}: {message[:200]}{'...' if len(str(message)) > 200 else ''}")
         parsed = self._protocol.parse(message)
         if parsed is None:
             logger.warning(f"Failed to parse message from {conn.device_id}")
             return
 
+        logger.debug(f"Parsed message type: {type(parsed).__name__}")
         if isinstance(parsed, HelloMessage):
             await self._handle_hello_obj(conn, parsed)
         elif isinstance(parsed, AudioMessage):
@@ -420,6 +415,7 @@ class ESP32Channel(BaseChannel):
             await self._handle_llm_obj(conn, parsed)
         elif isinstance(parsed, dict):
             msg_type = parsed.get("type")
+            logger.debug(f"Received dict message type: {msg_type}")
             if msg_type == MessageType.PING.value:
                 await self._handle_ping(conn, parsed)
             elif msg_type == MessageType.ABORT.value:
@@ -444,6 +440,10 @@ class ESP32Channel(BaseChannel):
 
         conn.voice_processor = None
 
+        # 生成 session_id
+        session_id = f"esp32:{conn.device_id}"
+        conn.session_id = session_id
+        
         # 根据文档规范，返回符合格式的 hello 响应
         response = self._protocol.encode_hello(
             device_id="copaw-server",
@@ -453,12 +453,14 @@ class ESP32Channel(BaseChannel):
             transport="websocket",
             audio_params={
                 "format": "opus",
-                "sample_rate": 16000,
+                "sample_rate": 24000,
                 "channels": 1,
                 "frame_duration": 60,
             },
+            session_id=session_id,
         )
         await conn.websocket.send(response)
+        logger.info(f"HELLO response sent to {conn.device_id}: {response[:100]}...")
         logger.info(f"HELLO processed for {conn.device_id}")
 
     async def _handle_audio_obj(
@@ -495,6 +497,16 @@ class ESP32Channel(BaseChannel):
 
         text = await conn.voice_processor.process_audio(audio_data, msg.sample_rate)
         if text:
+            # 发送 STT 消息给设备
+            stt_msg = self._protocol.encode_stt(
+                text=text,
+                session_id=conn.session_id,
+                is_final=True
+            )
+            await conn.websocket.send(stt_msg)
+            logger.info(f"STT sent to {conn.device_id}: {text}")
+            
+            # 处理用户文本
             await self._process_user_text(conn, text)
 
     async def _handle_text_obj(
@@ -532,6 +544,29 @@ class ESP32Channel(BaseChannel):
             logger.info(f"LISTEN stop for {conn.device_id}")
         elif msg.state == ListenState.DETECT:
             logger.info(f"Wake word detected for {conn.device_id}: {msg.text}")
+            # 根据协议规范，当检测到唤醒词时，返回hello响应
+            # 生成 session_id
+            session_id = f"esp32:{conn.device_id}"
+            conn.session_id = session_id
+            
+            # 返回符合格式的 hello 响应
+            response = self._protocol.encode_hello(
+                device_id="copaw-server",
+                client_id="copaw",
+                version="1",
+                features={"mcp": True},
+                transport="websocket",
+                audio_params={
+                    "format": "opus",
+                    "sample_rate": 24000,
+                    "channels": 1,
+                    "frame_duration": 60,
+                },
+                session_id=session_id,
+            )
+            await conn.websocket.send(response)
+            logger.info(f"HELLO response sent to {conn.device_id}: {response[:100]}...")
+            logger.info(f"HELLO response sent for wake word: {msg.text}")
 
     async def _handle_tts_obj(
         self,
@@ -571,6 +606,10 @@ class ESP32Channel(BaseChannel):
         # Don't initialize voice processor here, do it lazily when needed
         conn.voice_processor = None
 
+        # 生成 session_id
+        session_id = f"esp32:{conn.device_id}"
+        conn.session_id = session_id
+        
         # 根据文档规范，返回符合格式的 hello 响应
         response = self._protocol.encode_hello(
             device_id="copaw-server",
@@ -580,12 +619,14 @@ class ESP32Channel(BaseChannel):
             transport="websocket",
             audio_params={
                 "format": "opus",
-                "sample_rate": 16000,
+                "sample_rate": 24000,
                 "channels": 1,
                 "frame_duration": 60,
             },
+            session_id=session_id,
         )
         await conn.websocket.send(response)
+        logger.info(f"HELLO response sent to {conn.device_id}: {response[:100]}...")
         logger.info(f"HELLO processed for {conn.device_id}")
 
     async def _handle_audio(
@@ -778,14 +819,14 @@ class ESP32Channel(BaseChannel):
 
             # 发送 TTS start 消息
             logger.info(f"Sending TTS start message to {conn.device_id}")
-            tts_start = self._protocol.encode_tts_start()
+            tts_start = self._protocol.encode_tts_start(session_id=conn.session_id)
             if not await self._send_with_retry(conn, tts_start):
                 conn.state = DeviceState.IDLE
                 return
             
             # 发送句子开始消息
             logger.info(f"Sending TTS sentence message to {conn.device_id}: {text}")
-            tts_sentence = self._protocol.encode_tts_sentence(text)
+            tts_sentence = self._protocol.encode_tts_sentence(text, session_id=conn.session_id)
             if not await self._send_with_retry(conn, tts_sentence):
                 conn.state = DeviceState.IDLE
                 return
@@ -852,7 +893,7 @@ class ESP32Channel(BaseChannel):
             # 发送 TTS stop 消息
             if not conn._is_aborted and await self._check_connection(conn):
                 logger.info(f"Sending TTS stop message to {conn.device_id}")
-                tts_stop = self._protocol.encode_tts_stop()
+                tts_stop = self._protocol.encode_tts_stop(session_id=conn.session_id)
                 await self._send_with_retry(conn, tts_stop)
                 
         except asyncio.CancelledError:
@@ -884,7 +925,7 @@ class ESP32Channel(BaseChannel):
             logger.exception(f"Error checking connection for {conn.device_id}")
             return False
 
-    async def _send_with_retry(self, conn: ESP32DeviceConnection, data: Union[str, bytes], max_retries: int = 3) -> bool:
+    async def _send_with_retry(self, conn: ESP32DeviceConnection, data: str | bytes, max_retries: int = 3) -> bool:
         """发送消息并在失败时重试"""
         for attempt in range(max_retries):
             if not await self._check_connection(conn):

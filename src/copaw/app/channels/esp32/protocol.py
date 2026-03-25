@@ -150,14 +150,14 @@ class XiaozhiProtocol:
 
         if msg_type == MessageType.AUDIO.value or "audio" in obj:
             return self._parse_audio(obj)
-        elif msg_type == MessageType.TEXT.value or "text" in obj:
+        elif msg_type == MessageType.HELLO.value:
+            return self._parse_hello(obj)
+        elif msg_type == MessageType.TEXT.value or ("text" in obj and msg_type == ""):
             return TextMessage(
                 type=MessageType.TEXT,
                 text=obj.get("text", ""),
                 sequence=obj.get("sequence", 0),
             )
-        elif msg_type == MessageType.HELLO.value:
-            return self._parse_hello(obj)
         elif msg_type == MessageType.STATE.value:
             return StateMessage(
                 type=MessageType.STATE,
@@ -344,6 +344,7 @@ class XiaozhiProtocol:
         features: Optional[Dict[str, Any]] = None,
         transport: str = "websocket",
         audio_params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         msg = {
             "type": MessageType.HELLO.value,
@@ -352,7 +353,7 @@ class XiaozhiProtocol:
             "transport": transport,
             "audio_params": audio_params or {
                 "format": "opus",
-                "sample_rate": 16000,
+                "sample_rate": 24000,
                 "channels": 1,
                 "frame_duration": 60,
             },
@@ -361,6 +362,8 @@ class XiaozhiProtocol:
             msg["device_id"] = device_id
         if client_id:
             msg["client_id"] = client_id
+        if session_id:
+            msg["session_id"] = session_id
         return json.dumps(msg)
 
     def encode_pong(self, timestamp: int = 0) -> str:
@@ -405,32 +408,40 @@ class XiaozhiProtocol:
             msg["reason"] = reason
         return json.dumps(msg)
 
-    def encode_tts_start(self) -> str:
+    def encode_tts_start(self, session_id: str = "") -> str:
         msg = {
             "type": MessageType.TTS.value,
             "state": "start",
         }
+        if session_id:
+            msg["session_id"] = session_id
         return json.dumps(msg)
 
-    def encode_tts_stop(self) -> str:
+    def encode_tts_stop(self, session_id: str = "") -> str:
         msg = {
             "type": MessageType.TTS.value,
             "state": "stop",
         }
+        if session_id:
+            msg["session_id"] = session_id
         return json.dumps(msg)
 
-    def encode_tts_sentence(self, text: str) -> str:
+    def encode_tts_sentence(self, text: str, session_id: str = "") -> str:
         msg = {
             "type": MessageType.TTS.value,
             "state": "sentence_start",
             "text": text,
         }
+        if session_id:
+            msg["session_id"] = session_id
         return json.dumps(msg)
 
-    def encode_stt(self, text: str, is_final: bool = True) -> str:
+    def encode_stt(self, text: str, session_id: str = "", is_final: bool = True) -> str:
         msg = {
             "type": MessageType.STT.value,
             "text": text,
             "is_final": is_final,
         }
+        if session_id:
+            msg["session_id"] = session_id
         return json.dumps(msg)
