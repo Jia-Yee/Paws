@@ -127,44 +127,11 @@ class VoiceProcessor:
             return None
 
         result = await self._asr.transcribe(audio_data, self._config.sample_rate)
-        
-        # 🔧 关键修复：过滤不合理的ASR结果
-        filtered_text = self._filter_asr_result(result.text)
-        
-        if filtered_text and self._on_text_recognized:
-            self._on_text_recognized(filtered_text, result.is_final)
+        if result.text and self._on_text_recognized:
+            self._on_text_recognized(result.text, result.is_final)
 
-        logger.info(f"ASR result: {filtered_text or 'filtered out'}")
-        return filtered_text
-
-    def _filter_asr_result(self, text: str) -> Optional[str]:
-        """过滤不合理的ASR结果"""
-        if not text:
-            return None
-        
-        # 1. 长度过滤：太短或太长的结果
-        text = text.strip()
-        if len(text) < 2 or len(text) > 50:
-            logger.warning(f"Filtered ASR result due to length: '{text}'")
-            return None
-        
-        # 2. 内容过滤：包含奇怪词汇
-        weird_patterns = [
-            "僵尸", "僵战", "hello hello", "玩嗯",
-            "你好你好", "小智小智", "哈哈", "呵呵"
-        ]
-        for pattern in weird_patterns:
-            if pattern in text:
-                logger.warning(f"Filtered ASR result due to weird pattern: '{text}'")
-                return None
-        
-        # 3. 语言过滤：确保包含中文
-        has_chinese = any('\u4e00' <= char <= '\u9fff' for char in text)
-        if not has_chinese:
-            logger.warning(f"Filtered ASR result due to no Chinese: '{text}'")
-            return None
-        
-        return text
+        logger.info(f"ASR result: {result.text}")
+        return result.text
 
     async def synthesize_speech(
         self,
