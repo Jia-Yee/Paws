@@ -18,7 +18,7 @@ def pcm_to_wav(
     data_size = len(pcm_data)
 
     header = struct.pack(
-        "<4sI4sIHHIIHH4sI",
+        "<4sI4s4sIHHIIHH4sI",
         b"RIFF",
         36 + data_size,
         b"WAVE",

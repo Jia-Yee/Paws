@@ -12,9 +12,11 @@ import logging
 import os
 import threading
 import time
+import wave  # Added for debug audio saving
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
+import numpy as np  # Added for PCM analysis
 import websockets
 from websockets.server import serve
 
@@ -72,6 +74,7 @@ class ESP32DeviceConnection:
         self._speaking_task: Optional[asyncio.Task] = None
         self._opus_decoder: Optional[OpusDecoder] = None
         self._opus_encoder: Optional[OpusEncoder] = None
+        self._new_session_event: asyncio.Event = asyncio.Event()  # 🔧 新会话事件标志
 
     def update_activity(self) -> None:
         self.last_activity = time.time()
@@ -152,7 +155,7 @@ class ESP32Channel(BaseChannel):
             vad_type=self.voice_config.get("vad_type", "silero"),
             vad_threshold=self.voice_config.get("vad_threshold", 0.5),
             asr_type="funasr",
-            asr_model="models/SenseVoiceSmall",
+            asr_model="paraformer-zh",  # 🔧 关键修复：使用纯中文 Paraformer 模型，避免 SenseVoice 多语言混合问题
             tts_type=self.voice_config.get("tts_type", "edge"),
             tts_voice=self.voice_config.get("tts_voice", "zh-CN-XiaoxiaoNeural"),
             sample_rate=self.voice_config.get("sample_rate", 16000),
@@ -177,7 +180,7 @@ class ESP32Channel(BaseChannel):
             "vad_type": os.getenv("ESP32_VAD_TYPE", "silero"),
             "vad_threshold": float(os.getenv("ESP32_VAD_THRESHOLD", "0.5")),
             "asr_type": os.getenv("ESP32_ASR_TYPE", "funasr"),
-            "asr_model": os.getenv("ESP32_ASR_MODEL", "models/SenseVoiceSmall"),
+            "asr_model": os.getenv("ESP32_ASR_MODEL", "paraformer-zh"),  # 🔧 关键修复：使用纯中文 Paraformer 模型
             "tts_type": os.getenv("ESP32_TTS_TYPE", "edge"),
             "tts_voice": os.getenv("ESP32_TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
             "sample_rate": int(os.getenv("ESP32_SAMPLE_RATE", "16000")),
@@ -459,7 +462,7 @@ class ESP32Channel(BaseChannel):
             transport="websocket",
             audio_params={
                 "format": "opus",
-                "sample_rate": 24000,
+                "sample_rate": 16000,  # ✅ 使用 16kHz（ESP32 实际发送的）
                 "channels": 1,
                 "frame_duration": 60,
             },
@@ -485,7 +488,36 @@ class ESP32Channel(BaseChannel):
             logger.info(f"Device is speaking, aborting for {conn.device_id}")
             await self._handle_abort(conn)
 
+        # 🔍 关键修改：检测是否是新对话的开始（从 IDLE 状态进入 LISTENING）
+        is_new_session = (conn.state == DeviceState.IDLE)
+        if is_new_session:
+            logger.info(f"🎤 NEW SESSION DETECTED: Starting fresh audio capture for {conn.device_id}")
+            conn._audio_buffer = []  # 清空旧缓冲区
+            conn._wake_word_saved = False  # 标记唤醒词还未保存
+        
         conn.state = DeviceState.LISTENING
+        
+        # 🔍 关键调试：先记录原始 Opus 数据
+        logger.info(f"[OPUS] Raw data: {len(msg.data)} bytes, hex={msg.data[:32].hex()}...")
+        logger.info(f"[OPUS] Stats: min={min(msg.data)}, max={max(msg.data)}, avg={sum(msg.data)//len(msg.data)}")
+        
+        # 🔍 保存原始 Opus 数据包到文件（使用高精度时间戳和递增计数器）
+        import os
+        import time
+        
+        # 🆕 关键修复：使用新目录保存最新测试数据，避免与历史数据混淆
+        debug_dir = os.path.join(os.path.dirname(__file__), '../../../test_audio_latest')
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # 使用毫秒级完整时间戳（不取模）+ 纳秒计数器确保唯一性
+        base_timestamp = int(time.time() * 1000)
+        nano_suffix = time.time_ns() % 1000000  # 微秒级后缀（0-999999）
+        full_timestamp = f"{base_timestamp}_{nano_suffix}"
+        
+        opus_dump_path = os.path.join(debug_dir, f"raw_opus_{conn.device_id}_{full_timestamp}_{len(msg.data)}bytes.bin")
+        with open(opus_dump_path, 'wb') as f:
+            f.write(msg.data)
+        logger.info(f"Saved raw Opus packet to {opus_dump_path}")
         
         # 处理 Opus 编码的音频
         audio_data = msg.data
@@ -502,25 +534,109 @@ class ESP32Channel(BaseChannel):
                 logger.debug(f"Decoding Opus audio: {len(audio_data)} bytes")
                 audio_data = conn._opus_decoder.decode(audio_data)
                 logger.debug(f"Decoded to PCM: {len(audio_data)} bytes")
+                
+                # 🔍 关键调试：检查解码后的 PCM 数据
+                import numpy as np
+                pcm_array = np.frombuffer(audio_data, dtype=np.int16)
+                dynamic_range = pcm_array.max() - pcm_array.min()
+                logger.info(f"[PCM DECODED] Samples: {len(pcm_array)}, min={pcm_array.min()}, max={pcm_array.max()}, mean={pcm_array.mean():.2f}, dynamic_range={dynamic_range}")
+                logger.info(f"[PCM DECODED] First 10 samples: {pcm_array[:10]}")
+                
+                # 🔍 保存每个解码后的 PCM 包（带高精度时间戳，避免覆盖）
+                single_wav_path = os.path.join(debug_dir, f"single_{conn.device_id}_{full_timestamp}.wav")
+                with wave.open(single_wav_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(msg.sample_rate)
+                    wf.writeframes(audio_data)
+                single_duration_ms = len(pcm_array) / msg.sample_rate * 1000
+                logger.info(f"Saved single packet PCM to {single_wav_path} (duration={single_duration_ms:.1f}ms)")
+                
+                # 🔍 关键新增：如果是新会话的第一个包，保存到特殊文件（可能是唤醒词！）
+                if is_new_session and not getattr(conn, '_wake_word_saved', False):
+                    wake_word_path = os.path.join(debug_dir, f"WAKE_WORD_{conn.device_id}_{full_timestamp}.wav")
+                    with wave.open(wake_word_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(msg.sample_rate)
+                        wf.writeframes(audio_data)
+                    logger.info(f"💾 SAVED WAKE WORD (first packet) to {wake_word_path}")
+                    conn._wake_word_saved = True
+                    
+                    # 同时保存前几个包的连续录音
+                    conn._continuous_buffer = [audio_data]
+                    logger.info("📼 Starting continuous recording for wake word analysis")
+                elif hasattr(conn, '_continuous_buffer') and len(conn._continuous_buffer) < 20:
+                    # 保存前 20 个包用于完整唤醒词分析
+                    conn._continuous_buffer.append(audio_data)
+                    if len(conn._continuous_buffer) == 20:
+                        # 保存完整的连续录音（使用最新的高精度时间戳）
+                        continuous_timestamp = f"{base_timestamp}_{time.time_ns() % 1000000}"
+                        continuous_wav_path = os.path.join(debug_dir, f"CONTINUOUS_{conn.device_id}_{continuous_timestamp}.wav")
+                        with wave.open(continuous_wav_path, 'wb') as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(msg.sample_rate)
+                            wf.writeframes(b"".join(conn._continuous_buffer))
+                        continuous_duration = len(b"".join(conn._continuous_buffer)) / 2 / 16000
+                        logger.info(f"💾 SAVED CONTINUOUS RECORDING ({continuous_duration:.2f}s) to {continuous_wav_path}")
+                
             except OpusCodecError as e:
                 logger.error(f"Opus decode error: {e}")
                 return
         
-        # 重采样音频到 16000Hz，因为 ASR 模型期望 16kHz 音频
-        resampled_audio = resample_audio(audio_data, msg.sample_rate, 16000)
-        logger.debug(f"Resampled audio from {msg.sample_rate}Hz to 16000Hz: {len(audio_data)} bytes -> {len(resampled_audio)} bytes")
+        # 🔍 关键修复：ESP32 已经发送 16kHz 音频，不需要重采样！
+        logger.info(f"[SAMPLE RATE] ESP32 sends {msg.sample_rate}Hz, ASR expects 16000Hz")
+        
+        if msg.sample_rate == 16000:
+            resampled_audio = audio_data
+            logger.info(f"[NO RESAMPLE] Using decoded PCM directly: {len(resampled_audio)} bytes")
+        else:
+            resampled_audio = resample_audio(audio_data, msg.sample_rate, 16000)
+            logger.info(f"[RESAMPLED] {msg.sample_rate}Hz -> 16000Hz: {len(audio_data)} -> {len(resampled_audio)} bytes")
+        
+        # 🔍 检查重采样后的数据
+        resampled_array = np.frombuffer(resampled_audio, dtype=np.int16)
+        logger.info(f"[PCM RESAMPLED] Samples: {len(resampled_array)}, min={resampled_array.min()}, max={resampled_array.max()}, mean={resampled_array.mean():.2f}")
         
         # 累积音频数据
         conn._audio_buffer.append(resampled_audio)
-        logger.debug(f"Audio buffer size: {len(conn._audio_buffer)} chunks, total bytes: {sum(len(chunk) for chunk in conn._audio_buffer)}")
+        total_bytes = sum(len(chunk) for chunk in conn._audio_buffer)
+        total_samples = total_bytes // 2  # 16-bit = 2 bytes per sample
+        total_duration = total_samples / 16000  # seconds
+        logger.info(f"Audio buffer: {len(conn._audio_buffer)} chunks, {total_bytes} bytes, duration={total_duration:.3f}s")
         
-        # 当音频缓冲区达到一定大小或者接收到足够的音频数据时，处理整个语音段
-        # 这里我们设置一个阈值，当缓冲区大小超过 1MB 时处理，或者当接收到 10 个音频块时处理
-        if len(conn._audio_buffer) >= 10 or sum(len(chunk) for chunk in conn._audio_buffer) >= 1024 * 1024:
+        # 🔧 关键修复 1: 增加最小录音时长，确保录到完整指令
+        # 原逻辑：10 个包 (600ms) → 新逻辑：15 个包 (900ms)
+        if len(conn._audio_buffer) >= 15 or total_bytes >= 1024 * 1024:
             logger.info(f"Processing accumulated audio data for {conn.device_id}")
-            # 合并所有音频数据
             combined_audio = b"".join(conn._audio_buffer)
             logger.info(f"Combined audio size: {len(combined_audio)} bytes")
+            
+            # 🔍 保存合并后的音频（带高精度时间戳，避免覆盖）
+            combined_timestamp = f"{base_timestamp}_{time.time_ns() % 1000000}"
+            combined_wav_path = os.path.join(debug_dir, f"combined_{conn.device_id}_{combined_timestamp}.wav")
+            with wave.open(combined_wav_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(combined_audio)
+            
+            combined_samples = len(combined_audio) // 2
+            combined_duration = combined_samples / 16000
+            logger.info(f"Saved combined audio to {combined_wav_path} (samples={combined_samples}, duration={combined_duration:.3f}s)")
+            
+            # 🔧 关键修复 2: 添加音频质量检查，过滤低质量录音
+            combined_array = np.frombuffer(combined_audio, dtype=np.int16)
+            combined_dynamic_range = combined_array.max() - combined_array.min()
+            combined_rms = np.sqrt(np.mean(combined_array.astype(float)**2))
+            logger.info(f"[COMBINED ANALYSIS] Samples: {len(combined_array)}, min={combined_array.min():+d}, max={combined_array.max():+d}, mean={combined_array.mean():.2f}, dynamic_range={combined_dynamic_range}, RMS={combined_rms:.1f}")
+            
+            # 质量门控：动态范围 < 1000 或 RMS < 200 则丢弃
+            if combined_dynamic_range < 1000 or combined_rms < 200:
+                logger.warning(f"⚠️ Audio quality too poor (DR={combined_dynamic_range}, RMS={combined_rms:.1f}), skipping ASR")
+                conn._audio_buffer.clear()
+                return
             
             # 处理合并后的音频数据
             text = await conn.voice_processor.process_audio(combined_audio, 16000)
@@ -579,10 +695,35 @@ class ESP32Channel(BaseChannel):
             logger.info(f"LISTEN stop for {conn.device_id}")
         elif msg.state == ListenState.DETECT:
             logger.info(f"Wake word detected for {conn.device_id}: {msg.text}")
-            # 根据协议规范，当检测到唤醒词时，返回hello响应
+            
+            # 🔧 关键修复：唤醒词检测到时，清除之前可能累积的错误音频
+            # 因为 ESP32 先发送音频包，后发送唤醒词通知，导致时序问题
+            if hasattr(conn, '_audio_buffer') and conn._audio_buffer:
+                # 🔧 不要全部清除！保留最后 2-3 个包作为唤醒词的尾部上下文
+                # 这样既能去除前面的噪音，又能保留完整的唤醒词用于后续可能的 VAD 检测
+                chunks_to_keep = min(3, len(conn._audio_buffer))
+                removed_count = len(conn._audio_buffer) - chunks_to_keep
+                
+                if removed_count > 0:
+                    logger.warning(f"🚨 WAKE WORD LATE! Removing {removed_count} old chunks, keeping last {chunks_to_keep} for context")
+                    conn._audio_buffer = conn._audio_buffer[-chunks_to_keep:]
+                else:
+                    logger.debug(f"Keeping all {len(conn._audio_buffer)} chunks as wake word context")
+            
+            # 重置 VoiceProcessor，确保从唤醒词后开始重新识别
+            if conn.voice_processor:
+                conn.voice_processor.reset()
+            
+            # 🔧 设置新会话标志，让后续音频从头开始累积
+            conn._new_session_event.set()
+            
+            # 根据协议规范，当检测到唤醒词时，返回 hello 响应
             # 生成 session_id
             session_id = f"esp32:{conn.device_id}"
             conn.session_id = session_id
+            
+            # 🔧 设置新会话标志，让后续音频从头开始累积
+            conn._new_session_event.set()
             
             # 返回符合格式的 hello 响应
             response = self._protocol.encode_hello(
@@ -593,7 +734,7 @@ class ESP32Channel(BaseChannel):
                 transport="websocket",
                 audio_params={
                     "format": "opus",
-                    "sample_rate": 24000,
+                    "sample_rate": 16000,
                     "channels": 1,
                     "frame_duration": 60,
                 },
@@ -654,7 +795,7 @@ class ESP32Channel(BaseChannel):
             transport="websocket",
             audio_params={
                 "format": "opus",
-                "sample_rate": 24000,
+                "sample_rate": 16000,  # 🔧 修复：改为 16kHz，与 ESP32 实际发送的一致
                 "channels": 1,
                 "frame_duration": 60,
             },

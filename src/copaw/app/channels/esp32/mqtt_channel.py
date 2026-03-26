@@ -134,7 +134,7 @@ class ESP32MQTTChannel(BaseChannel):
             vad_type=self.voice_config.get("vad_type", "silero"),
             vad_threshold=self.voice_config.get("vad_threshold", 0.5),
             asr_type="funasr",
-            asr_model="models/SenseVoiceSmall",
+            asr_model="paraformer-zh",  # 🔧 关键修复：使用纯中文 Paraformer 模型，避免 SenseVoice 多语言混合问题
             tts_type=self.voice_config.get("tts_type", "edge"),
             tts_voice=self.voice_config.get("tts_voice", "zh-CN-XiaoxiaoNeural"),
             sample_rate=self.voice_config.get("sample_rate", 16000),
@@ -183,7 +183,7 @@ class ESP32MQTTChannel(BaseChannel):
             "vad_type": os.getenv("ESP32_MQTT_VAD_TYPE", "silero"),
             "vad_threshold": float(os.getenv("ESP32_MQTT_VAD_THRESHOLD", "0.5")),
             "asr_type": os.getenv("ESP32_MQTT_ASR_TYPE", "funasr"),
-            "asr_model": os.getenv("ESP32_MQTT_ASR_MODEL", "models/SenseVoiceSmall"),
+            "asr_model": os.getenv("ESP32_MQTT_ASR_MODEL", "paraformer-zh"),  # 🔧 关键修复：使用纯中文 Paraformer 模型
             "tts_type": os.getenv("ESP32_MQTT_TTS_TYPE", "edge"),
             "tts_voice": os.getenv("ESP32_MQTT_TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
             "sample_rate": int(os.getenv("ESP32_MQTT_SAMPLE_RATE", "16000")),

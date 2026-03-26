@@ -355,7 +355,7 @@ class XiaozhiProtocol:
             "transport": transport,
             "audio_params": audio_params or {
                 "format": "opus",
-                "sample_rate": 24000,
+                "sample_rate": 16000,  # 使用 16kHz (避免重采样失真)
                 "channels": 1,
                 "frame_duration": 60,
             },

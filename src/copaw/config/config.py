@@ -176,7 +176,7 @@ class ESP32VoiceConfig(BaseModel):
     vad_type: str = "silero"
     vad_threshold: float = 0.5
     asr_type: str = "funasr"
-    asr_model: str = "models/SenseVoiceSmall"
+    asr_model: str = "paraformer-zh"  # 🔧 关键修复：使用纯中文 Paraformer 模型，避免 SenseVoice 多语言混合问题
     tts_type: str = "edge"
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
     sample_rate: int = 16000

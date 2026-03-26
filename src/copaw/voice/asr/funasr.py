@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class FunASR(ASRBase):
     def __init__(
         self,
-        model: str = "iic/speech_paraformer_zh-cn_16k_common-vocab8404_pytorch",
+        model: str = "paraformer-zh",  # 🔧 关键修复：使用纯中文 Paraformer 模型，避免 SenseVoice 的多语言混合问题
         sample_rate: int = 16000,
         device: str = "cpu",
         offline: bool = True,
@@ -41,7 +41,9 @@ class FunASR(ASRBase):
             self._model = AutoModel(
                 model=self._model_name,
                 device=self._device,
-                disable_update=True  # 禁用更新检查，加快加载速度
+                vad_kwargs={"max_single_segment_time": 30000},
+                disable_update=True,
+                hub="hf"
             )
             logger.info(f"FunASR model '{self._model_name}' loaded successfully")
         except ImportError:
@@ -71,11 +73,21 @@ class FunASR(ASRBase):
         def _run_inference():
             result = self._model.generate(
                 input=audio_float,
-                batch_size=1,
+                cache={},
+                language="zh",  # 🔧 关键修复：强制使用中文识别，避免多语言混合乱码
+                use_itn=True,
+                batch_size_s=60,
             )
             if result and len(result) > 0:
                 text = result[0].get("text", "")
-                return text
+                # Process the output to remove tags and get clean text
+                import re
+                # Extract all tags (in order)
+                tag_pattern = r"<\|([^|]+)\|>"
+                all_tags = re.findall(tag_pattern, text)
+                # Remove all <|...|> format tags to get clean text
+                clean_text = re.sub(tag_pattern, "", text).strip()
+                return clean_text
             return ""
 
         text = await asyncio.to_thread(_run_inference)
