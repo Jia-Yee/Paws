@@ -368,6 +368,13 @@ class XiaozhiProtocol:
             msg["session_id"] = session_id
         return json.dumps(msg)
 
+    def encode_ping(self, timestamp: int = 0) -> str:
+        msg = {
+            "type": MessageType.PING.value,
+            "timestamp": timestamp,
+        }
+        return json.dumps(msg)
+
     def encode_pong(self, timestamp: int = 0) -> str:
         msg = {
             "type": MessageType.PONG.value,

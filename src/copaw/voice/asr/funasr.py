@@ -36,8 +36,11 @@ class FunASR(ASRBase):
         if self._model is not None:
             return
         try:
+            logger.info("Attempting to import FunASR...")
             from funasr import AutoModel
+            logger.info("FunASR imported successfully")
 
+            logger.info(f"Creating FunASR model: {self._model_name}")
             self._model = AutoModel(
                 model=self._model_name,
                 device=self._device,
@@ -46,12 +49,17 @@ class FunASR(ASRBase):
                 hub="hf"
             )
             logger.info(f"FunASR model '{self._model_name}' loaded successfully")
-        except ImportError:
+        except ImportError as e:
+            logger.error(f"ImportError loading FunASR: {e}")
+            import traceback
+            traceback.print_exc()
             logger.warning("FunASR not installed, using mock implementation")
             self._model = "mock"
-        except Exception:
-            logger.exception("Failed to load FunASR model")
-            raise
+        except Exception as e:
+            logger.error(f"Error loading FunASR model: {e}")
+            import traceback
+            traceback.print_exc()
+            self._model = "mock"
 
     def reset(self) -> None:
         self._audio_buffer.clear()

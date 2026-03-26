@@ -3,7 +3,7 @@ name = "copaw"
 dynamic = ["version"]
 description = "CoPaw is a **personal assistant** that runs in your own environment. It talks to you over multiple channels (DingTalk, Feishu, QQ, Discord, iMessage, etc.) and runs scheduled tasks according to your configuration. **What it can do is driven by Skills — the possibilities are open-ended.** Built-in skills include cron, PDF/Office handling, news digest, file reading, and more; you can add custom skills. All data and tasks run on your machine; no third-party hosting."
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10"
 dependencies = [
     "agentscope==1.0.17",
     "agentscope-runtime==1.1.1",
@@ -20,7 +20,9 @@ dependencies = [
     "transformers>=4.30.0",
     "python-dotenv>=1.0.0",
     "python-socks>=2.5.3",
-    "onnxruntime<1.24",
+    "onnxruntime>=1.24.1",
+    "funasr>=1.3.1",
+    "opuslib-next>=0.2.1",
     "lark-oapi>=1.5.3",
     "python-telegram-bot>=20.0",
     "twilio>=9.10.2",

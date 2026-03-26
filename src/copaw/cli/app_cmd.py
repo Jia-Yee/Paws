@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 import click
 import uvicorn
 
 from ..constant import LOG_LEVEL_ENV
 from ..config.utils import write_last_api
-from ..utils.logging import setup_logger, SuppressPathAccessLogFilter
+from ..utils.logging import setup_logger, SuppressPathAccessLogFilter, add_copaw_file_handler
 
 
 @click.command("app")
