@@ -68,6 +68,10 @@ async def handle_audio_message(conn: "ESP32DeviceConnection", audio: bytes):
             frame_window_threshold=3
         )
     
+    # 初始化最后活动时间
+    if not hasattr(conn, "last_activity_time"):
+        conn.last_activity_time = time.time() * 1000
+    
     vad_tracker = conn._vad_tracker
     
     # 当前片段是否有人说话
@@ -75,9 +79,11 @@ async def handle_audio_message(conn: "ESP32DeviceConnection", audio: bytes):
     if conn.vad:
         try:
             have_voice = await detect_voice_activity(conn, audio, vad_tracker)
+            logger.debug(f"VAD detection result: have_voice={have_voice}, voice_window={list(vad_tracker.voice_window)}")
         except Exception as e:
             logger.warning(f"VAD detection failed: {e}")
             have_voice = False
+    logger.debug(f"Final have_voice: {have_voice}")
     
     # 如果设备刚刚被唤醒，短暂忽略VAD检测
     # 但继续接收音频，只是认为所有音频都有语音（避免丢失唤醒词后的语音）
@@ -109,11 +115,14 @@ async def detect_voice_activity(conn: "ESP32DeviceConnection", opus_packet: byte
         decoder = tracker.init_decoder()
         
         # 解码Opus到PCM
+        logger.debug(f"Decoding Opus packet of length: {len(opus_packet)}")
         pcm_frame = decoder.decode(opus_packet, 960)  # 60ms at 16kHz = 960 samples
+        logger.debug(f"Decoded PCM frame length: {len(pcm_frame)}")
         
         if not hasattr(conn, "client_audio_buffer"):
             conn.client_audio_buffer = bytearray()
         conn.client_audio_buffer.extend(pcm_frame)
+        logger.debug(f"Client audio buffer length: {len(conn.client_audio_buffer)}")
         
         client_have_voice = False
         
@@ -141,7 +150,9 @@ async def detect_voice_activity(conn: "ESP32DeviceConnection", opus_packet: byte
             # 更新滑动窗口
             tracker.voice_window.append(is_voice)
             client_have_voice = tracker.voice_window.count(True) >= tracker.frame_window_threshold
+            logger.debug(f"VAD chunk: is_voice={is_voice}, prob={speech_prob}, window={list(tracker.voice_window)}, have_voice={client_have_voice}")
         
+        logger.debug(f"Returning client_have_voice: {client_have_voice}")
         return client_have_voice
         
     except opuslib_next.OpusError as e:
@@ -319,12 +330,15 @@ async def no_voice_close_connect(conn: "ESP32DeviceConnection", have_voice: bool
     """设备长时间空闲检测"""
     if have_voice:
         conn.last_activity_time = time.time() * 1000
+        logger.debug(f"Have voice, updating last_activity_time to {conn.last_activity_time}")
         return
     
     # 只有在已经初始化过时间戳的情况下才进行超时检查
     if conn.last_activity_time > 0.0:
         no_voice_time = time.time() * 1000 - conn.last_activity_time
-        close_connection_no_voice_time = 120  # 默认120秒
+        close_connection_no_voice_time = 300  # 默认300秒（5分钟）
+        
+        logger.debug(f"No voice, no_voice_time={no_voice_time/1000:.2f}s, threshold={close_connection_no_voice_time}s")
         
         if no_voice_time > 1000 * close_connection_no_voice_time:
             # 发送空闲状态通知
@@ -332,6 +346,15 @@ async def no_voice_close_connect(conn: "ESP32DeviceConnection", have_voice: bool
             state_msg = conn.protocol.encode_state(DeviceState.IDLE)
             await conn.websocket.send(state_msg)
             logger.info(f"Device {conn.device_id} idle for too long, entering idle state")
+            
+            # 关闭连接
+            logger.info(f"Closing connection for {conn.device_id} due to inactivity")
+            try:
+                await conn.websocket.close(code=1000, reason="Idle timeout")
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
+    else:
+        logger.debug("last_activity_time not initialized, skipping idle check")
 
 
 async def handle_abort_message(conn: "ESP32DeviceConnection"):
