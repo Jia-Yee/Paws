@@ -328,7 +328,9 @@ async def no_voice_close_connect(conn: "ESP32DeviceConnection", have_voice: bool
         
         if no_voice_time > 1000 * close_connection_no_voice_time:
             # 发送空闲状态通知
-            await conn.protocol.send_state(conn, "idle")
+            from ..constants import DeviceState
+            state_msg = conn.protocol.encode_state(DeviceState.IDLE)
+            await conn.websocket.send(state_msg)
             logger.info(f"Device {conn.device_id} idle for too long, entering idle state")
 
 
