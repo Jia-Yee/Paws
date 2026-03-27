@@ -49,5 +49,12 @@ copaw app --host 0.0.0.0 --port 8000 --reload
 ## 贡献指南
 欢迎提交 Issue 和 Pull Request 来帮助改进项目。
 
+## 感谢 (Thanks)
+- 感谢 xiaozhi-esp32-server 项目提供的参考实现
+- 感谢 Silero VAD 提供的语音活动检测模型
+- 感谢 FunASR 提供的自动语音识别服务
+- 感谢 Edge TTS 提供的文本转语音服务
+- 感谢所有为项目做出贡献的开发者
+
 ## 许可证
 MIT License
