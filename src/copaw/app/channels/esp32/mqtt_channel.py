@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 import paho.mqtt.client as mqtt
 
@@ -45,6 +45,68 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class VADStateTracker:
+    """VAD状态跟踪器 - 用于检测语音的开始和结束"""
+    
+    def __init__(self, threshold=0.5, threshold_low=0.2, window_size=5, min_speech_frames=3):
+        """初始化VAD状态跟踪器"""
+        self.threshold = threshold  # 语音检测阈值
+        self.threshold_low = threshold_low  # 低阈值（用于避免抖动）
+        self.window_size = window_size  # 滑动窗口大小
+        self.min_speech_frames = min_speech_frames  # 认为有语音的最小帧数
+        
+        self.voice_buffer = []  # 音频缓冲区
+        self.is_speaking = False  # 当前是否正在说话
+        self.speech_start_time = 0  # 语音开始时间
+        self.silence_start_time = 0  # 静音开始时间
+        self.silence_duration_threshold = 1.0  # 静音持续时间阈值（秒）
+        
+    def reset(self):
+        """重置VAD状态"""
+        self.voice_buffer = []
+        self.is_speaking = False
+        self.speech_start_time = 0
+        self.silence_start_time = 0
+    
+    def process_frame(self, probability, current_time=None):
+        """处理一帧音频的VAD结果"""
+        if current_time is None:
+            current_time = time.time()
+        
+        # 添加到缓冲区并保持窗口大小
+        self.voice_buffer.append(probability)
+        if len(self.voice_buffer) > self.window_size:
+            self.voice_buffer.pop(0)
+        
+        # 计算滑动窗口内的语音概率
+        if self.voice_buffer:
+            avg_prob = sum(self.voice_buffer) / len(self.voice_buffer)
+        else:
+            avg_prob = 0
+        
+        # 状态判断
+        if not self.is_speaking:
+            # 检测语音开始
+            if avg_prob > self.threshold:
+                self.is_speaking = True
+                self.speech_start_time = current_time
+                self.silence_start_time = 0
+                return True, False  # 开始说话，不是结束
+        else:
+            # 检测语音结束
+            if avg_prob < self.threshold_low:
+                if self.silence_start_time == 0:
+                    self.silence_start_time = current_time
+                elif current_time - self.silence_start_time >= self.silence_duration_threshold:
+                    self.is_speaking = False
+                    return False, True  # 不是开始，结束说话
+            else:
+                # 重置静音开始时间
+                self.silence_start_time = 0
+        
+        return False, False  # 无状态变化
+
+
 class ESP32MQTTDeviceConnection:
     """ESP32 MQTT device connection."""
     
@@ -68,12 +130,31 @@ class ESP32MQTTDeviceConnection:
         self._speaking_task: Optional[asyncio.Task] = None
         self._opus_decoder: Optional[OpusDecoder] = None
         self._opus_encoder: Optional[OpusEncoder] = None
+        # VAD 相关
+        self._vad_tracker = VADStateTracker()
+        self.client_audio_buffer = bytearray()
+        self.client_have_voice = False
+        self.client_voice_stop = False
+        self.just_woken_up = False
+        self.skip_next_asr = False
+        self.can_process_audio = False
+        self.is_processing_dialogue = False
     
     def update_activity(self) -> None:
         self.last_activity = time.time()
     
     def is_idle(self, timeout_seconds: float = 300.0) -> bool:
         return time.time() - self.last_activity > timeout_seconds
+    
+    def reset_audio_states(self):
+        """重置音频相关状态"""
+        self.client_audio_buffer = bytearray()
+        self.client_have_voice = False
+        self.client_voice_stop = False
+        self.just_woken_up = False
+        self.skip_next_asr = False
+        if hasattr(self, "_vad_tracker"):
+            self._vad_tracker.reset()
 
 
 class ESP32MQTTChannel(BaseChannel):
@@ -375,6 +456,16 @@ class ESP32MQTTChannel(BaseChannel):
         conn: ESP32MQTTDeviceConnection,
         msg: AudioMessage,
     ) -> None:
+        # 检查是否可以处理音频（在收到listen start消息后才处理）
+        if not conn.can_process_audio:
+            # 不处理音频，直接返回
+            return
+        
+        # 检查是否正在处理对话（暂停音频处理）
+        if conn.is_processing_dialogue:
+            # 正在处理对话，暂停音频处理
+            return
+            
         if conn.voice_processor is None:
             conn.voice_processor = VoiceProcessor(config=self._voice_processor_config)
             await conn.voice_processor.initialize()
@@ -384,13 +475,16 @@ class ESP32MQTTChannel(BaseChannel):
         
         conn.state = DeviceState.LISTENING
         
-        # Handle Opus encoded audio
+        # 处理音频数据
         audio_data = msg.data
+        sample_rate = msg.sample_rate
+        
+        # Handle Opus encoded audio
         if msg.format == AudioFormat.OPUS:
             try:
                 if conn._opus_decoder is None:
                     conn._opus_decoder = OpusDecoder(
-                        sample_rate=msg.sample_rate,
+                        sample_rate=sample_rate,
                         channels=msg.channels,
                     )
                 audio_data = conn._opus_decoder.decode(audio_data)
@@ -398,11 +492,69 @@ class ESP32MQTTChannel(BaseChannel):
                 logger.error(f"Opus decode error: {e}")
                 return
         
-        conn._audio_buffer.append(audio_data)
+        # 累积音频数据
+        conn.client_audio_buffer.extend(audio_data)
         
-        text = await conn.voice_processor.process_audio(audio_data, msg.sample_rate)
-        if text:
-            await self._process_user_text(conn, text)
+        # VAD 检测
+        if conn.voice_processor and hasattr(conn.voice_processor, 'vad') and conn.voice_processor.vad:
+            try:
+                # 对于 Opus 解码后的 PCM 数据，直接进行 VAD 检测
+                vad_result = conn.voice_processor.vad.is_speech(audio_data, sample_rate=sample_rate)
+                if isinstance(vad_result, bool):
+                    probability = 1.0 if vad_result else 0.0
+                else:
+                    # 对于返回 probability 的 VAD 实现
+                    probability = vad_result if hasattr(vad_result, 'probability') else (1.0 if vad_result.is_speech else 0.0)
+                
+                # 处理 VAD 状态
+                speech_start, speech_end = conn._vad_tracker.process_frame(probability)
+                
+                if speech_start:
+                    conn.client_have_voice = True
+                    conn.client_voice_stop = False
+                elif speech_end:
+                    conn.client_voice_stop = True
+            except Exception as e:
+                logger.warning(f"VAD detection failed: {e}")
+        
+        # 如果设备刚刚被唤醒，短暂忽略VAD检测
+        if conn.just_woken_up:
+            conn.client_have_voice = True
+            conn.client_voice_stop = False
+            # 设置一个短暂延迟后恢复VAD检测
+            if not hasattr(conn, "vad_resume_task") or (hasattr(conn, "vad_resume_task") and conn.vad_resume_task.done()):
+                conn.vad_resume_task = asyncio.create_task(self._resume_vad_detection(conn))
+        
+        # 当检测到语音停止时，处理音频
+        if conn.client_voice_stop and conn.client_have_voice:
+            if len(conn.client_audio_buffer) > 0:
+                audio_data = bytes(conn.client_audio_buffer)
+                conn.client_audio_buffer = bytearray()
+                conn.client_have_voice = False
+                conn.client_voice_stop = False
+                
+                # 触发 ASR 处理
+                if not conn.skip_next_asr:
+                    text = await conn.voice_processor.process_audio(audio_data, sample_rate)
+                    if text and text.strip():
+                        logger.info(f"ASR result: '{text}'")
+                        
+                        # 发送STT消息给设备
+                        stt_msg = self._protocol.encode_stt(text, is_final=True)
+                        await self._publish_to_device(conn, stt_msg)
+                        logger.info(f"[STT SENT] Device: {conn.device_id}, Text: {text}")
+                        
+                        # 设置标志，暂停音频处理，直到对话完成
+                        conn.is_processing_dialogue = True
+                        
+                        # 处理用户文本
+                        await self._process_user_text(conn, text)
+                    else:
+                        logger.info("ASR returned empty text")
+                else:
+                    # 跳过 ASR（用于唤醒词）
+                    conn.skip_next_asr = False
+                    logger.info("Skipping ASR for wake word")
     
     async def _handle_text_obj(
         self,
@@ -434,12 +586,27 @@ class ESP32MQTTChannel(BaseChannel):
             conn.state = DeviceState.LISTENING
             if conn.voice_processor:
                 conn.voice_processor.reset()
+            # 重置音频处理状态
+            conn.reset_audio_states()
+            # 开始处理音频
+            conn.can_process_audio = True
             logger.info(f"LISTEN start for {conn.device_id}")
         elif msg.state == ListenState.STOP:
             conn.state = DeviceState.IDLE
+            # 停止处理音频
+            conn.can_process_audio = False
             logger.info(f"LISTEN stop for {conn.device_id}")
         elif msg.state == ListenState.DETECT:
+            # 检测到唤醒词
             logger.info(f"Wake word detected for {conn.device_id}: {msg.text}")
+            # 重置音频状态
+            conn.reset_audio_states()
+            # 标记刚刚被唤醒
+            conn.just_woken_up = True
+            # 跳过下一次ASR（避免识别唤醒词）
+            conn.skip_next_asr = True
+            # 暂时不处理音频，等待listen start消息
+            conn.can_process_audio = False
     
     async def _handle_tts_obj(
         self,
@@ -573,6 +740,12 @@ class ESP32MQTTChannel(BaseChannel):
         response = self._protocol.encode_pong(msg.get("timestamp", 0))
         await self._publish_to_device(conn, response)
     
+    async def _resume_vad_detection(self, conn: ESP32MQTTDeviceConnection):
+        """延迟后恢复VAD检测"""
+        await asyncio.sleep(0.5)  # 短暂延迟
+        conn.just_woken_up = False
+        logger.info(f"Resumed VAD detection for {conn.device_id}")
+    
     async def _process_user_text(
         self,
         conn: ESP32MQTTDeviceConnection,
@@ -599,6 +772,7 @@ class ESP32MQTTChannel(BaseChannel):
         except Exception:
             logger.exception(f"Error processing text from {conn.device_id}")
             await self._send_error(conn, 500, "Processing error")
+            conn.is_processing_dialogue = False
         finally:
             conn.state = DeviceState.IDLE
     
@@ -654,10 +828,28 @@ class ESP32MQTTChannel(BaseChannel):
                 tts_stop = self._protocol.encode_tts_stop()
                 await self._publish_to_device(conn, tts_stop)
                 
+            # TTS完成后，发送listen消息让ESP32进入listening状态
+            if not conn._is_aborted:
+                logger.info(f"Sending listen start message to {conn.device_id}")
+                listen_start = self._protocol.encode_start_listen(mode="auto")
+                await self._publish_to_device(conn, listen_start)
+                # 更新连接状态
+                conn.state = DeviceState.LISTENING
+                # 重置音频处理状态，准备接收新的语音
+                conn.can_process_audio = True
+                conn.reset_audio_states()
+                # 清除对话处理标志，恢复音频处理
+                conn.is_processing_dialogue = False
+                logger.info(f"Device {conn.device_id} is now listening")
+                
         except asyncio.CancelledError:
+            conn.state = DeviceState.IDLE
+            conn.is_processing_dialogue = False
             pass
         except Exception:
             logger.exception(f"Error sending speech to {conn.device_id}")
+            conn.state = DeviceState.IDLE
+            conn.is_processing_dialogue = False
             # Fallback to text on error
             try:
                 text_msg = self._protocol.encode_text(text)
