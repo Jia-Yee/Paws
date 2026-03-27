@@ -1,0 +1,18 @@
+{
+  "channels": {
+    "esp32": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 8080
+    },
+    "esp32-mqtt": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 1883,
+      "username": "",
+      "password": "",
+      "keepalive": 60,
+      "topic_prefix": "xiaozhi"
+    }
+  }
+}
