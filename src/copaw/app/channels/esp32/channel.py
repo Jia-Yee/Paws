@@ -493,6 +493,7 @@ class ESP32Channel(BaseChannel):
             logger.exception(f"Error processing text from {conn.device_id}")
             await self._send_error(conn, 500, "Processing error")
             conn.state = DeviceState.IDLE
+            conn.is_processing_dialogue = False
 
     async def _send_speech(
         self,
@@ -608,15 +609,19 @@ class ESP32Channel(BaseChannel):
                     conn._vad_tracker.reset()
                 if hasattr(conn, "client_audio_buffer"):
                     conn.client_audio_buffer = bytearray()
+                # 清除对话处理标志，恢复音频处理
+                conn.is_processing_dialogue = False
                 logger.info(f"Device {conn.device_id} is now listening")
                 
         except asyncio.CancelledError:
             logger.info(f"Speech sending cancelled for {conn.device_id}")
             conn.state = DeviceState.IDLE
+            conn.is_processing_dialogue = False
             pass
         except Exception:
             logger.exception(f"Error sending speech to {conn.device_id}")
             conn.state = DeviceState.IDLE
+            conn.is_processing_dialogue = False
             # Fallback to text on error
             try:
                 if await self._check_connection(conn):

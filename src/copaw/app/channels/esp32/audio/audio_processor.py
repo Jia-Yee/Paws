@@ -54,6 +54,11 @@ async def handle_audio_message(conn: "ESP32DeviceConnection", audio: bytes):
         # 不处理音频，直接返回
         return
     
+    # 检查是否正在处理对话（暂停音频处理）
+    if hasattr(conn, "is_processing_dialogue") and conn.is_processing_dialogue:
+        # 正在处理对话，暂停音频处理
+        return
+    
     # 初始化VAD状态跟踪器
     if not hasattr(conn, "_vad_tracker"):
         conn._vad_tracker = VADStateTracker(
@@ -228,6 +233,9 @@ async def handle_voice_stop(conn: "ESP32DeviceConnection", asr_audio_task: list)
                 })
                 await conn.websocket.send(stt_msg)
                 logger.info(f"[STT SENT] Device: {conn.device_id}, Text: {text}")
+                
+                # 设置标志，暂停音频处理，直到对话完成
+                conn.is_processing_dialogue = True
                 
                 # 触发后续处理（AI回复）
                 # 通过channel调用AI处理
