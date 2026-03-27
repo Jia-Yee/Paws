@@ -312,6 +312,7 @@ class ESP32Channel(BaseChannel):
             device_id=device_id,
             websocket=websocket,
             protocol=self._protocol,
+            channel=self,
         )
 
         # 🔧 新增：设置事件循环
@@ -491,7 +492,6 @@ class ESP32Channel(BaseChannel):
         except Exception:
             logger.exception(f"Error processing text from {conn.device_id}")
             await self._send_error(conn, 500, "Processing error")
-        finally:
             conn.state = DeviceState.IDLE
 
     async def _send_speech(
@@ -593,12 +593,30 @@ class ESP32Channel(BaseChannel):
                 logger.info(f"Sending TTS stop message to {conn.device_id}")
                 tts_stop = self._protocol.encode_tts_stop(session_id=conn.session_id)
                 await self._send_with_retry(conn, tts_stop)
+            
+            # TTS完成后，发送listen消息让ESP32进入listening状态
+            if await self._check_connection(conn):
+                logger.info(f"Sending listen start message to {conn.device_id}")
+                listen_start = self._protocol.encode_start_listen(mode="auto")
+                await self._send_with_retry(conn, listen_start)
+                # 更新连接状态
+                conn.state = DeviceState.LISTENING
+                # 重置音频处理状态，准备接收新的语音
+                conn.can_process_audio = True
+                conn.reset_audio_states()
+                if hasattr(conn, "_vad_tracker"):
+                    conn._vad_tracker.reset()
+                if hasattr(conn, "client_audio_buffer"):
+                    conn.client_audio_buffer = bytearray()
+                logger.info(f"Device {conn.device_id} is now listening")
                 
         except asyncio.CancelledError:
             logger.info(f"Speech sending cancelled for {conn.device_id}")
+            conn.state = DeviceState.IDLE
             pass
         except Exception:
             logger.exception(f"Error sending speech to {conn.device_id}")
+            conn.state = DeviceState.IDLE
             # Fallback to text on error
             try:
                 if await self._check_connection(conn):

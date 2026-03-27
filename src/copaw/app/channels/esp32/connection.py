@@ -30,10 +30,12 @@ class ESP32DeviceConnection:
         device_id: str,
         websocket: websockets.ServerConnection,
         protocol: XiaozhiProtocol,
+        channel=None,
     ):
         self.device_id = device_id
         self.websocket = websocket
         self.protocol = protocol
+        self._channel = channel  # 引用channel实例
         self.state: DeviceState = DeviceState.IDLE
         self.client_id: str = ""
         self.version: str = ""

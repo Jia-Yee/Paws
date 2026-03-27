@@ -230,7 +230,13 @@ async def handle_voice_stop(conn: "ESP32DeviceConnection", asr_audio_task: list)
                 logger.info(f"[STT SENT] Device: {conn.device_id}, Text: {text}")
                 
                 # 触发后续处理（AI回复）
-                await start_to_chat(conn, text)
+                # 通过channel调用AI处理
+                from ..channel import ESP32Channel
+                # 获取channel实例 - 通过connection的引用
+                if hasattr(conn, '_channel'):
+                    await start_to_chat(conn, conn._channel, text)
+                else:
+                    logger.warning("Channel reference not found in connection")
             else:
                 logger.info("ASR returned empty text")
         else:
@@ -277,18 +283,21 @@ def decode_opus_packets(opus_packets: list) -> list:
                 pass
 
 
-async def start_to_chat(conn: "ESP32DeviceConnection", text: str):
+async def start_to_chat(conn: "ESP32DeviceConnection", channel, text: str):
     """开始对话处理 - 发送给AI处理"""
     try:
-        # 这里应该调用AI处理流程
-        # 简化版本：直接记录日志，实际应该调用对话管理器
         logger.info(f"Starting chat with text: {text}")
         
-        # TODO: 调用AI处理并发送TTS回复
-        # 这部分需要集成到现有的对话流程中
-        
+        # 调用channel的_process_user_text方法来处理AI对话
+        if channel and hasattr(channel, '_process_user_text'):
+            await channel._process_user_text(conn, text)
+        else:
+            logger.warning("Channel not available for processing text")
+            
     except Exception as e:
         logger.error(f"Error in start_to_chat: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 
 async def resume_vad_detection(conn: "ESP32DeviceConnection"):
