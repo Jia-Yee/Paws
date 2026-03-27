@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import queue
 import threading
 import time
 import wave  # Added for debug audio saving
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
@@ -42,6 +44,9 @@ from .protocol import (
     XiaozhiMessage,
     XiaozhiProtocol,
 )
+from .connection import ESP32DeviceConnection
+from .handlers.text_handler import handle_text_message
+from .audio.audio_processor import handle_audio_message
 from .utils import calculate_audio_duration_ms, pcm_to_wav, resample_audio
 from ....voice import VoiceProcessor, VoiceProcessorConfig
 from ....voice.opus import OpusDecoder, OpusEncoder, OpusCodecError
@@ -52,35 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ESP32DeviceConnection:
-    def __init__(
-        self,
-        device_id: str,
-        websocket: websockets.ServerConnection,
-        protocol: XiaozhiProtocol,
-    ):
-        self.device_id = device_id
-        self.websocket = websocket
-        self.protocol = protocol
-        self.state: DeviceState = DeviceState.IDLE
-        self.client_id: str = ""
-        self.version: str = ""
-        self.session_id: str = ""
-        self.audio_config: Dict[str, Any] = {}
-        self.last_activity: float = time.time()
-        self.voice_processor: Optional[VoiceProcessor] = None
-        self._audio_buffer: List[bytes] = []
-        self._is_aborted: bool = False
-        self._speaking_task: Optional[asyncio.Task] = None
-        self._opus_decoder: Optional[OpusDecoder] = None
-        self._opus_encoder: Optional[OpusEncoder] = None
-        self._new_session_event: asyncio.Event = asyncio.Event()  # 🔧 新会话事件标志
 
-    def update_activity(self) -> None:
-        self.last_activity = time.time()
-
-    def is_idle(self, timeout_seconds: float = 300.0) -> bool:
-        return time.time() - self.last_activity > timeout_seconds
 
 
 class ESP32Channel(BaseChannel):
@@ -149,6 +126,7 @@ class ESP32Channel(BaseChannel):
         self._connections_lock = asyncio.Lock()
 
         self._voice_processor_config = self._build_voice_config()
+        self._idle_check_task: Optional[asyncio.Task] = None
 
     def _build_voice_config(self) -> VoiceProcessorConfig:
         return VoiceProcessorConfig(
@@ -268,15 +246,29 @@ class ESP32Channel(BaseChannel):
         self._loop = asyncio.get_running_loop()
 
         logger.info(f"Starting ESP32 channel on {self.host}:{self.port}")
+        # 🔧 关键修复：添加 WebSocket 心跳参数，避免连接超时
         self._server = await serve(
             self._handle_connection,
             self.host,
-            self.port
+            self.port,
+            # 设置心跳间隔为 20 秒，超时为 10 秒
+            ping_interval=20.0,
+            ping_timeout=10.0
         )
         logger.info(f"ESP32 channel started on ws://{self.host}:{self.port}")
+        
+        # 启动空闲检查任务
+        self._idle_check_task = asyncio.create_task(self._check_idle_connections())
+        logger.info("Idle connection check task started")
 
     async def stop(self) -> None:
         self._stop_event.set()
+        if self._idle_check_task:
+            self._idle_check_task.cancel()
+            try:
+                await self._idle_check_task
+            except asyncio.CancelledError:
+                pass
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -322,6 +314,30 @@ class ESP32Channel(BaseChannel):
             protocol=self._protocol,
         )
 
+        # 🔧 新增：设置事件循环
+        conn.loop = asyncio.get_running_loop()
+        
+        # 初始化音频组件
+        try:
+            # 初始化VAD
+            from copaw.voice.vad import create_vad
+            conn.vad = create_vad(vad_type="silero", sample_rate=16000, threshold=0.5)
+            logger.info(f"VAD initialized for {conn.device_id}")
+            
+            # 初始化ASR
+            from copaw.voice.processor import VoiceProcessor
+            conn.voice_processor = VoiceProcessor(config=self._voice_processor_config)
+            await conn.voice_processor.initialize()
+            conn.asr = conn.voice_processor
+            logger.info(f"ASR initialized for {conn.device_id}")
+            
+            # 初始化TTS
+            from copaw.voice.tts import EdgeTTS
+            conn.tts = EdgeTTS()
+            logger.info(f"TTS initialized for {conn.device_id}")
+        except Exception as e:
+            logger.error(f"Error initializing audio components: {e}")
+
         async with self._connections_lock:
             self._connections[device_id] = conn
 
@@ -336,6 +352,8 @@ class ESP32Channel(BaseChannel):
         except Exception:
             logger.exception(f"Error handling ESP32 connection: {device_id}")
         finally:
+            # 🔧 新增：停止事件
+            conn.stop_event.set()
             async with self._connections_lock:
                 self._connections.pop(device_id, None)
 
@@ -390,6 +408,8 @@ class ESP32Channel(BaseChannel):
         except Exception:
             return False
 
+
+
     async def _handle_message(
         self,
         conn: ESP32DeviceConnection,
@@ -398,519 +418,21 @@ class ESP32Channel(BaseChannel):
         # 记录接收到的消息类型和大小
         if isinstance(message, bytes):
             logger.info(f"Received binary data from {conn.device_id}: {len(message)} bytes")
+            # 处理音频消息
+            await handle_audio_message(conn, message)
         else:
             logger.debug(f"Received text message from {conn.device_id}: {message[:200]}{'...' if len(str(message)) > 200 else ''}")
+            # 处理文本消息
+            await handle_text_message(conn, message)
+
+
         
-        parsed = self._protocol.parse(message)
-        if parsed is None:
-            logger.warning(f"Failed to parse message from {conn.device_id}")
-            return
 
-        logger.info(f"Parsed message type: {type(parsed).__name__}")
-        if isinstance(parsed, HelloMessage):
-            await self._handle_hello_obj(conn, parsed)
-        elif isinstance(parsed, AudioMessage):
-            logger.info(f"Processing audio message: {len(parsed.data)} bytes")
-            await self._handle_audio_obj(conn, parsed)
-        elif isinstance(parsed, TextMessage):
-            await self._handle_text_obj(conn, parsed)
-        elif isinstance(parsed, ListenMessage):
-            await self._handle_listen_obj(conn, parsed)
-        elif isinstance(parsed, TTSMessage):
-            await self._handle_tts_obj(conn, parsed)
-        elif isinstance(parsed, STTMessage):
-            await self._handle_stt_obj(conn, parsed)
-        elif isinstance(parsed, LLMMessage):
-            await self._handle_llm_obj(conn, parsed)
-        elif isinstance(parsed, dict):
-            msg_type = parsed.get("type")
-            logger.debug(f"Received dict message type: {msg_type}")
-            if msg_type == MessageType.PING.value:
-                await self._handle_ping(conn, parsed)
-            elif msg_type == MessageType.ABORT.value:
-                await self._handle_abort(conn)
-            elif msg_type == MessageType.HELLO.value:
-                await self._handle_hello(conn, parsed)
-            elif msg_type == MessageType.AUDIO.value:
-                await self._handle_audio(conn, parsed)
-            elif msg_type == MessageType.TEXT.value:
-                await self._handle_text(conn, parsed)
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
 
-    async def _handle_hello_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: HelloMessage,
-    ) -> None:
-        conn.client_id = msg.client_id
-        conn.version = msg.version
-        conn.audio_config = msg.audio_config or {}
 
-        conn.voice_processor = None
 
-        # 生成 session_id
-        session_id = f"esp32:{conn.device_id}"
-        conn.session_id = session_id
-        
-        # 根据文档规范，返回符合格式的 hello 响应
-        response = self._protocol.encode_hello(
-            device_id="copaw-server",
-            client_id="copaw",
-            version="1",
-            features={"mcp": True},
-            transport="websocket",
-            audio_params={
-                "format": "opus",
-                "sample_rate": 16000,  # ✅ 使用 16kHz（ESP32 实际发送的）
-                "channels": 1,
-                "frame_duration": 60,
-            },
-            session_id=session_id,
-        )
-        await conn.websocket.send(response)
-        logger.info(f"HELLO response sent to {conn.device_id}: {response[:100]}...")
-        logger.info(f"HELLO processed for {conn.device_id}")
 
-    async def _handle_audio_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: AudioMessage,
-    ) -> None:
-        logger.info(f"Handling audio from {conn.device_id}: format={msg.format}, sample_rate={msg.sample_rate}, channels={msg.channels}, data_len={len(msg.data)}")
-        
-        if conn.voice_processor is None:
-            logger.info(f"Initializing voice processor for {conn.device_id}")
-            conn.voice_processor = VoiceProcessor(config=self._voice_processor_config)
-            await conn.voice_processor.initialize()
 
-        if conn.state == DeviceState.SPEAKING:
-            logger.info(f"Device is speaking, aborting for {conn.device_id}")
-            await self._handle_abort(conn)
-
-        # 🔍 关键修改：检测是否是新对话的开始（从 IDLE 状态进入 LISTENING）
-        is_new_session = (conn.state == DeviceState.IDLE)
-        if is_new_session:
-            logger.info(f"🎤 NEW SESSION DETECTED: Starting fresh audio capture for {conn.device_id}")
-            conn._audio_buffer = []  # 清空旧缓冲区
-            conn._wake_word_saved = False  # 标记唤醒词还未保存
-        
-        conn.state = DeviceState.LISTENING
-        
-        # 🔍 关键调试：先记录原始 Opus 数据
-        logger.info(f"[OPUS] Raw data: {len(msg.data)} bytes, hex={msg.data[:32].hex()}...")
-        logger.info(f"[OPUS] Stats: min={min(msg.data)}, max={max(msg.data)}, avg={sum(msg.data)//len(msg.data)}")
-        
-        # 🔍 保存原始 Opus 数据包到文件（使用高精度时间戳和递增计数器）
-        import os
-        import time
-        
-        # 🆕 关键修复：使用新目录保存最新测试数据，避免与历史数据混淆
-        debug_dir = os.path.join(os.path.dirname(__file__), '../../../test_audio_latest')
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        # 使用毫秒级完整时间戳（不取模）+ 纳秒计数器确保唯一性
-        base_timestamp = int(time.time() * 1000)
-        nano_suffix = time.time_ns() % 1000000  # 微秒级后缀（0-999999）
-        full_timestamp = f"{base_timestamp}_{nano_suffix}"
-        
-        opus_dump_path = os.path.join(debug_dir, f"raw_opus_{conn.device_id}_{full_timestamp}_{len(msg.data)}bytes.bin")
-        with open(opus_dump_path, 'wb') as f:
-            f.write(msg.data)
-        logger.info(f"Saved raw Opus packet to {opus_dump_path}")
-        
-        # 处理 Opus 编码的音频
-        audio_data = msg.data
-        if msg.format == AudioFormat.OPUS:
-            try:
-                # 初始化 Opus 解码器（如果需要）
-                if conn._opus_decoder is None:
-                    logger.info(f"Initializing Opus decoder for {conn.device_id}: sample_rate={msg.sample_rate}, channels={msg.channels}")
-                    conn._opus_decoder = OpusDecoder(
-                        sample_rate=msg.sample_rate,
-                        channels=msg.channels,
-                    )
-                # 解码 Opus 到 PCM
-                logger.debug(f"Decoding Opus audio: {len(audio_data)} bytes")
-                audio_data = conn._opus_decoder.decode(audio_data)
-                logger.debug(f"Decoded to PCM: {len(audio_data)} bytes")
-                
-                # 🔍 关键调试：检查解码后的 PCM 数据
-                import numpy as np
-                pcm_array = np.frombuffer(audio_data, dtype=np.int16)
-                dynamic_range = pcm_array.max() - pcm_array.min()
-                logger.info(f"[PCM DECODED] Samples: {len(pcm_array)}, min={pcm_array.min()}, max={pcm_array.max()}, mean={pcm_array.mean():.2f}, dynamic_range={dynamic_range}")
-                logger.info(f"[PCM DECODED] First 10 samples: {pcm_array[:10]}")
-                
-                # 🔍 保存每个解码后的 PCM 包（带高精度时间戳，避免覆盖）
-                single_wav_path = os.path.join(debug_dir, f"single_{conn.device_id}_{full_timestamp}.wav")
-                with wave.open(single_wav_path, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(msg.sample_rate)
-                    wf.writeframes(audio_data)
-                single_duration_ms = len(pcm_array) / msg.sample_rate * 1000
-                logger.info(f"Saved single packet PCM to {single_wav_path} (duration={single_duration_ms:.1f}ms)")
-                
-                # 🔍 关键新增：如果是新会话的第一个包，保存到特殊文件（可能是唤醒词！）
-                if is_new_session and not getattr(conn, '_wake_word_saved', False):
-                    wake_word_path = os.path.join(debug_dir, f"WAKE_WORD_{conn.device_id}_{full_timestamp}.wav")
-                    with wave.open(wake_word_path, 'wb') as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(msg.sample_rate)
-                        wf.writeframes(audio_data)
-                    logger.info(f"💾 SAVED WAKE WORD (first packet) to {wake_word_path}")
-                    conn._wake_word_saved = True
-                    
-                    # 同时保存前几个包的连续录音
-                    conn._continuous_buffer = [audio_data]
-                    logger.info("📼 Starting continuous recording for wake word analysis")
-                elif hasattr(conn, '_continuous_buffer') and len(conn._continuous_buffer) < 20:
-                    # 保存前 20 个包用于完整唤醒词分析
-                    conn._continuous_buffer.append(audio_data)
-                    if len(conn._continuous_buffer) == 20:
-                        # 保存完整的连续录音（使用最新的高精度时间戳）
-                        continuous_timestamp = f"{base_timestamp}_{time.time_ns() % 1000000}"
-                        continuous_wav_path = os.path.join(debug_dir, f"CONTINUOUS_{conn.device_id}_{continuous_timestamp}.wav")
-                        with wave.open(continuous_wav_path, 'wb') as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(msg.sample_rate)
-                            wf.writeframes(b"".join(conn._continuous_buffer))
-                        continuous_duration = len(b"".join(conn._continuous_buffer)) / 2 / 16000
-                        logger.info(f"💾 SAVED CONTINUOUS RECORDING ({continuous_duration:.2f}s) to {continuous_wav_path}")
-                
-            except OpusCodecError as e:
-                logger.error(f"Opus decode error: {e}")
-                return
-        
-        # 🔍 关键修复：ESP32 已经发送 16kHz 音频，不需要重采样！
-        logger.info(f"[SAMPLE RATE] ESP32 sends {msg.sample_rate}Hz, ASR expects 16000Hz")
-        
-        if msg.sample_rate == 16000:
-            resampled_audio = audio_data
-            logger.info(f"[NO RESAMPLE] Using decoded PCM directly: {len(resampled_audio)} bytes")
-        else:
-            resampled_audio = resample_audio(audio_data, msg.sample_rate, 16000)
-            logger.info(f"[RESAMPLED] {msg.sample_rate}Hz -> 16000Hz: {len(audio_data)} -> {len(resampled_audio)} bytes")
-        
-        # 🔍 检查重采样后的数据
-        resampled_array = np.frombuffer(resampled_audio, dtype=np.int16)
-        logger.info(f"[PCM RESAMPLED] Samples: {len(resampled_array)}, min={resampled_array.min()}, max={resampled_array.max()}, mean={resampled_array.mean():.2f}")
-        
-        # 累积音频数据
-        conn._audio_buffer.append(resampled_audio)
-        total_bytes = sum(len(chunk) for chunk in conn._audio_buffer)
-        total_samples = total_bytes // 2  # 16-bit = 2 bytes per sample
-        total_duration = total_samples / 16000  # seconds
-        logger.info(f"Audio buffer: {len(conn._audio_buffer)} chunks, {total_bytes} bytes, duration={total_duration:.3f}s")
-        
-        # 🔧 关键修复 1: 增加最小录音时长，确保录到完整指令
-        # 原逻辑：10 个包 (600ms) → 新逻辑：15 个包 (900ms)
-        if len(conn._audio_buffer) >= 15 or total_bytes >= 1024 * 1024:
-            logger.info(f"Processing accumulated audio data for {conn.device_id}")
-            combined_audio = b"".join(conn._audio_buffer)
-            logger.info(f"Combined audio size: {len(combined_audio)} bytes")
-            
-            # 🔍 保存合并后的音频（带高精度时间戳，避免覆盖）
-            combined_timestamp = f"{base_timestamp}_{time.time_ns() % 1000000}"
-            combined_wav_path = os.path.join(debug_dir, f"combined_{conn.device_id}_{combined_timestamp}.wav")
-            with wave.open(combined_wav_path, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(combined_audio)
-            
-            combined_samples = len(combined_audio) // 2
-            combined_duration = combined_samples / 16000
-            logger.info(f"Saved combined audio to {combined_wav_path} (samples={combined_samples}, duration={combined_duration:.3f}s)")
-            
-            # 🔧 关键修复 2: 添加音频质量检查，过滤低质量录音
-            combined_array = np.frombuffer(combined_audio, dtype=np.int16)
-            combined_dynamic_range = combined_array.max() - combined_array.min()
-            combined_rms = np.sqrt(np.mean(combined_array.astype(float)**2))
-            logger.info(f"[COMBINED ANALYSIS] Samples: {len(combined_array)}, min={combined_array.min():+d}, max={combined_array.max():+d}, mean={combined_array.mean():.2f}, dynamic_range={combined_dynamic_range}, RMS={combined_rms:.1f}")
-            
-            # 质量门控：动态范围 < 1000 或 RMS < 200 则丢弃
-            if combined_dynamic_range < 1000 or combined_rms < 200:
-                logger.warning(f"⚠️ Audio quality too poor (DR={combined_dynamic_range}, RMS={combined_rms:.1f}), skipping ASR")
-                conn._audio_buffer.clear()
-                return
-            
-            # 处理合并后的音频数据
-            text = await conn.voice_processor.process_audio(combined_audio, 16000)
-            if text:
-                logger.info(f"Voice processor returned text: {text}")
-                # 发送 STT 消息给设备
-                stt_msg = self._protocol.encode_stt(
-                    text=text,
-                    session_id=conn.session_id,
-                    is_final=True
-                )
-                await conn.websocket.send(stt_msg)
-                logger.info(f"STT sent to {conn.device_id}: {text}")
-                
-                # 处理用户文本
-                await self._process_user_text(conn, text)
-                # 清空音频缓冲区，准备下一段语音
-                conn._audio_buffer.clear()
-            else:
-                logger.debug(f"No text returned from voice processor for {conn.device_id}")
-                # 清空音频缓冲区，准备下一段语音
-                conn._audio_buffer.clear()
-
-    async def _handle_text_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: TextMessage,
-    ) -> None:
-        if msg.type == MessageType.START_LISTEN:
-            conn.state = DeviceState.LISTENING
-            if conn.voice_processor:
-                conn.voice_processor.reset()
-            return
-        elif msg.type == MessageType.STOP_LISTEN:
-            conn.state = DeviceState.IDLE
-            return
-        elif msg.type == MessageType.ABORT:
-            await self._handle_abort(conn)
-            return
-
-        if msg.text:
-            await self._process_user_text(conn, msg.text)
-
-    async def _handle_listen_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: ListenMessage,
-    ) -> None:
-        if msg.state == ListenState.START:
-            conn.state = DeviceState.LISTENING
-            if conn.voice_processor:
-                conn.voice_processor.reset()
-            logger.info(f"LISTEN start for {conn.device_id}")
-        elif msg.state == ListenState.STOP:
-            conn.state = DeviceState.IDLE
-            logger.info(f"LISTEN stop for {conn.device_id}")
-        elif msg.state == ListenState.DETECT:
-            logger.info(f"Wake word detected for {conn.device_id}: {msg.text}")
-            
-            # 🔧 关键修复：唤醒词检测到时，清除之前可能累积的错误音频
-            # 因为 ESP32 先发送音频包，后发送唤醒词通知，导致时序问题
-            if hasattr(conn, '_audio_buffer') and conn._audio_buffer:
-                # 🔧 不要全部清除！保留最后 2-3 个包作为唤醒词的尾部上下文
-                # 这样既能去除前面的噪音，又能保留完整的唤醒词用于后续可能的 VAD 检测
-                chunks_to_keep = min(3, len(conn._audio_buffer))
-                removed_count = len(conn._audio_buffer) - chunks_to_keep
-                
-                if removed_count > 0:
-                    logger.warning(f"🚨 WAKE WORD LATE! Removing {removed_count} old chunks, keeping last {chunks_to_keep} for context")
-                    conn._audio_buffer = conn._audio_buffer[-chunks_to_keep:]
-                else:
-                    logger.debug(f"Keeping all {len(conn._audio_buffer)} chunks as wake word context")
-            
-            # 重置 VoiceProcessor，确保从唤醒词后开始重新识别
-            if conn.voice_processor:
-                conn.voice_processor.reset()
-            
-            # 🔧 设置新会话标志，让后续音频从头开始累积
-            conn._new_session_event.set()
-            
-            # 根据协议规范，当检测到唤醒词时，返回 hello 响应
-            # 生成 session_id
-            session_id = f"esp32:{conn.device_id}"
-            conn.session_id = session_id
-            
-            # 🔧 设置新会话标志，让后续音频从头开始累积
-            conn._new_session_event.set()
-            
-            # 返回符合格式的 hello 响应
-            response = self._protocol.encode_hello(
-                device_id="copaw-server",
-                client_id="copaw",
-                version="1",
-                features={"mcp": True},
-                transport="websocket",
-                audio_params={
-                    "format": "opus",
-                    "sample_rate": 16000,
-                    "channels": 1,
-                    "frame_duration": 60,
-                },
-                session_id=session_id,
-            )
-            await conn.websocket.send(response)
-            logger.info(f"HELLO response sent to {conn.device_id}: {response[:100]}...")
-            logger.info(f"HELLO response sent for wake word: {msg.text}")
-
-    async def _handle_tts_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: TTSMessage,
-    ) -> None:
-        if msg.state == TTSState.START:
-            logger.info(f"TTS start for {conn.device_id}")
-        elif msg.state == TTSState.STOP:
-            logger.info(f"TTS stop for {conn.device_id}")
-        elif msg.state == TTSState.SENTENCE_START:
-            logger.info(f"TTS sentence: {msg.text}")
-
-    async def _handle_stt_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: STTMessage,
-    ) -> None:
-        logger.info(f"STT result for {conn.device_id}: {msg.text} (final={msg.is_final})")
-
-    async def _handle_llm_obj(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: LLMMessage,
-    ) -> None:
-        logger.info(f"LLM emotion for {conn.device_id}: {msg.emotion}, text: {msg.text}")
-
-    async def _handle_hello(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: Dict[str, Any],
-    ) -> None:
-        conn.client_id = msg.get("client_id", msg.get("client-id", ""))
-        conn.version = msg.get("version", "")
-        conn.audio_config = msg.get("audio_params", msg.get("audio_config", {}))
-
-        # Don't initialize voice processor here, do it lazily when needed
-        conn.voice_processor = None
-
-        # 生成 session_id
-        session_id = f"esp32:{conn.device_id}"
-        conn.session_id = session_id
-        
-        # 根据文档规范，返回符合格式的 hello 响应
-        response = self._protocol.encode_hello(
-            device_id="copaw-server",
-            client_id="copaw",
-            version="1",
-            features={"mcp": True},
-            transport="websocket",
-            audio_params={
-                "format": "opus",
-                "sample_rate": 16000,  # 🔧 修复：改为 16kHz，与 ESP32 实际发送的一致
-                "channels": 1,
-                "frame_duration": 60,
-            },
-            session_id=session_id,
-        )
-        await conn.websocket.send(response)
-        logger.info(f"HELLO response sent to {conn.device_id}: {response[:100]}...")
-        logger.info(f"HELLO processed for {conn.device_id}")
-
-    async def _handle_audio(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: Dict[str, Any],
-    ) -> None:
-        if conn.voice_processor is None:
-            conn.voice_processor = VoiceProcessor(config=self._voice_processor_config)
-            await conn.voice_processor.initialize()
-
-        if conn.state == DeviceState.SPEAKING:
-            await self._handle_abort(conn)
-
-        conn.state = DeviceState.LISTENING
-        
-        # 获取音频数据
-        audio_data = msg.get("data", b"")
-        if isinstance(audio_data, str):
-            import base64
-            audio_data = base64.b64decode(audio_data)
-        
-        audio_config = msg.get("audio_config", {})
-        sample_rate = audio_config.get("sample_rate", 16000)
-        
-        conn._audio_buffer.append(audio_data)
-
-        text = await conn.voice_processor.process_audio(audio_data, sample_rate)
-        if text:
-            await self._process_user_text(conn, text)
-
-    async def _handle_text(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: Dict[str, Any],
-    ) -> None:
-        msg_type = msg.get("type")
-        if msg_type == MessageType.START_LISTEN.value:
-            conn.state = DeviceState.LISTENING
-            if conn.voice_processor:
-                conn.voice_processor.reset()
-            return
-        elif msg_type == MessageType.STOP_LISTEN.value:
-            conn.state = DeviceState.IDLE
-            return
-        elif msg_type == MessageType.ABORT.value:
-            await self._handle_abort(conn)
-            return
-
-        text = msg.get("text", "")
-        if text:
-            await self._process_user_text(conn, text)
-
-    async def _handle_abort(
-        self,
-        conn: ESP32DeviceConnection,
-    ) -> None:
-        conn._is_aborted = True
-        if conn._speaking_task and not conn._speaking_task.done():
-            conn._speaking_task.cancel()
-            try:
-                await conn._speaking_task
-            except asyncio.CancelledError:
-                pass
-        conn.state = DeviceState.IDLE
-        conn._is_aborted = False
-
-    async def close_audio_channel(
-        self,
-        device_id: str,
-        send_goodbye: bool = False,
-    ) -> None:
-        """关闭音频通道，符合文档规范"""
-        async with self._connections_lock:
-            conn = self._connections.get(device_id)
-        
-        if conn:
-            try:
-                # 取消正在进行的任务
-                if conn._speaking_task and not conn._speaking_task.done():
-                    conn._speaking_task.cancel()
-                    try:
-                        await conn._speaking_task
-                    except asyncio.CancelledError:
-                        pass
-                
-                # 关闭 WebSocket 连接
-                if conn.websocket:
-                    try:
-                        await conn.websocket.close()
-                    except Exception:
-                        pass
-                
-                # 清理连接
-                async with self._connections_lock:
-                    self._connections.pop(device_id, None)
-                
-                logger.info(f"Audio channel closed for {device_id}")
-            except Exception:
-                logger.exception(f"Error closing audio channel for {device_id}")
-
-    async def _handle_ping(
-        self,
-        conn: ESP32DeviceConnection,
-        msg: Dict[str, Any],
-    ) -> None:
-        response = self._protocol.encode_pong(msg.get("timestamp", 0))
-        await conn.websocket.send(response)
 
     async def _process_user_text(
         self,
@@ -1100,6 +622,43 @@ class ESP32Channel(BaseChannel):
         except Exception:
             logger.exception(f"Error checking connection for {conn.device_id}")
             return False
+
+    async def _check_idle_connections(self) -> None:
+        """定期检查空闲连接"""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(60)  # 每分钟检查一次
+                
+                async with self._connections_lock:
+                    idle_devices = []
+                    for device_id, conn in self._connections.items():
+                        if conn.is_idle(timeout_seconds=300):  # 5分钟无活动
+                            idle_devices.append(device_id)
+                    
+                    for device_id in idle_devices:
+                        conn = self._connections.get(device_id)
+                        if conn:
+                            logger.info(f"Device {device_id} has been idle for too long, sending wait state")
+                            try:
+                                # 发送状态消息通知设备进入等待状态
+                                state_msg = self._protocol.encode_state(
+                                    state=DeviceState.IDLE,
+                                    message="Idle timeout, waiting for wake word"
+                                )
+                                await conn.websocket.send(state_msg)
+                                logger.info(f"Sent wait state to {device_id}")
+                            except Exception as e:
+                                logger.error(f"Error sending wait state to {device_id}: {e}")
+                                # 如果发送失败，关闭连接
+                                try:
+                                    await conn.websocket.close()
+                                except Exception:
+                                    pass
+                                self._connections.pop(device_id, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error checking idle connections: {e}")
 
     async def _send_with_retry(self, conn: ESP32DeviceConnection, data: str | bytes, max_retries: int = 3) -> bool:
         """发送消息并在失败时重试"""

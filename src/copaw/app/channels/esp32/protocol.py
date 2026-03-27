@@ -131,8 +131,9 @@ class XiaozhiProtocol:
                     return self._parse_json(text)
             except UnicodeDecodeError:
                 pass
-            # 二进制音频数据默认为Opus格式
-            return AudioMessage(data=data, format=AudioFormat.OPUS)
+            # 解析ESP32发送的带有协议头的Opus数据
+            opus_data = self._parse_esp32_opus(data)
+            return AudioMessage(data=opus_data, format=AudioFormat.OPUS)
 
         if isinstance(data, str):
             if data.startswith("{"):
@@ -140,6 +141,41 @@ class XiaozhiProtocol:
             return TextMessage(text=data)
 
         return None
+
+    def _parse_esp32_opus(self, data: bytes) -> bytes:
+        """解析ESP32发送的带有协议头的Opus数据
+        
+        ESP32发送的音频数据格式：
+        - 版本2：4字节版本号+类型+保留+4字节时间戳+4字节负载大小+负载数据
+        - 版本3：1字节类型+1字节保留+2字节负载大小+负载数据
+        """
+        if len(data) < 4:
+            return data
+        
+        # 检查版本2格式
+        if len(data) >= 16:
+            # 版本2格式：版本号(2) + 类型(2) + 保留(2) + 时间戳(4) + 负载大小(4) = 16字节
+            import struct
+            version = struct.unpack('>H', data[0:2])[0]
+            if version == 2:
+                payload_size = struct.unpack('>I', data[12:16])[0]
+                if payload_size > 0 and len(data) >= 16 + payload_size:
+                    return data[16:16 + payload_size]
+                elif len(data) > 16:
+                    return data[16:]
+        
+        # 检查版本3格式
+        if len(data) >= 4:
+            # 版本3格式：类型(1) + 保留(1) + 负载大小(2) = 4字节
+            import struct
+            payload_size = struct.unpack('>H', data[2:4])[0]
+            if payload_size > 0 and len(data) >= 4 + payload_size:
+                return data[4:4 + payload_size]
+            elif len(data) > 4:
+                return data[4:]
+        
+        # 无法解析，返回原始数据
+        return data
 
     def _parse_json(self, text: str) -> Optional[XiaozhiMessage]:
         try:
