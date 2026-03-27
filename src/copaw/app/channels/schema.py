@@ -39,6 +39,7 @@ BUILTIN_CHANNEL_TYPES = (
     "console",
     "voice",
     "xiaoyi",
+    "esp32",
 )
 
 # ChannelType is str to allow plugin channels; built-in set above.

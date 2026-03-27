@@ -96,3 +96,9 @@ src/.hypothesis/
 
 # Kiro IDE
 .kiro/
+/src/copaw/test_audio
+/src/copaw/test_audio_latest
+/test_audio 18-42-44-962
+/test_audio
+/src/copaw/debug_audio_esp32
+/test_audio 16-16-12-706
