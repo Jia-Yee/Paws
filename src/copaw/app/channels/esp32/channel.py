@@ -218,7 +218,27 @@ class ESP32Channel(BaseChannel):
         sender_id: str,
         channel_meta: Optional[Dict[str, Any]] = None,
     ) -> str:
-        return f"esp32:{sender_id}"
+        """Resolve session_id: use explicit meta['session_id'] when provided,
+        otherwise generate a random session_id (same strategy as Console channel).
+        
+        This allows ESP32 devices to support multiple concurrent sessions,
+        similar to how the Console channel handles multiple browser tabs.
+        """
+        import time
+        import uuid
+        
+        meta = channel_meta or {}
+        
+        # If session_id is explicitly provided in meta, use it
+        if meta.get("session_id"):
+            return meta["session_id"]
+        
+        # Otherwise, generate a random session_id (timestamp-based for uniqueness)
+        # Format: esp32:{device_id}:{random_id}
+        # This maintains device identification while allowing multiple sessions
+        random_id = str(uuid.uuid4())[:8]  # Use first 8 chars of UUID for brevity
+        timestamp = int(time.time() * 1000)  # Millisecond timestamp
+        return f"esp32:{sender_id}:{timestamp}{random_id}"
 
     def build_agent_request_from_native(
         self,
